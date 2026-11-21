@@ -8,19 +8,23 @@
 #   .\run-inkling.ps1 -Foreground      # run in this window (Ctrl+C to stop) instead of the background
 #   .\run-inkling.ps1 -ModelDir D:\models -Engine C:\llama\llama-server.exe   # other locations
 #   .\run-inkling.ps1 -CacheRam 4096   # keep up to 4 GB of older chats' states in RAM for instant switching (default 0 = off)
+#   .\run-inkling.ps1 -Parallel 4      # serve 4 chats at once; they share one KV cache (-kvu), so no extra VRAM
 #
 # Notes:
 #  - If VRAM overflows, Windows silently spills into shared memory and speed halves:
 #    close other GPU-heavy apps (games, video editors, other AI tools) before starting.
 #  - RAM: the model is read straight into VRAM (-lm none, no memory-mapped copy of the 11 GB file)
 #    and the server's RAM prompt cache is off, so the server itself uses ~1 GB of system RAM.
+#    Each chat keeps only its 2 newest state snapshots (--ctx-checkpoints 2, ~50 MB each) instead of 32,
+#    so RAM stays flat in long chats and with -Parallel (enough to resume the next turn without reprocessing).
 #  - Log file: inkling-server.log next to this script.
 param(
     [int]$Ctx = 0,
     [switch]$Quality,
     [switch]$Foreground,
     [int]$Port = 8080,
-    [int]$CacheRam = 0
+    [int]$CacheRam = 0,
+    [int]$Parallel = 1
 )
 
 $exe = (Resolve-Path $Engine).Path   # custom build: fused Inkling kernels
@@ -32,10 +36,12 @@ if (Test-Path $pidFile) {
     if ($old -and $old.Path -eq $exe) { Write-Host "Server already running (PID $($old.Id)). Run .\stop-inkling.ps1 first." -ForegroundColor Yellow; exit 1 }
 }
 
-$common = @('--jinja', '-ngl', '99', '--fit', 'off', '-fa', 'on', '-np', '1',
+$common = @('--jinja', '-ngl', '99', '--fit', 'off', '-fa', 'on', '-np', "$Parallel", '--ctx-checkpoints', '2',
             '-lm', 'none', '--cache-ram', "$CacheRam",
             '--temp', '1.0', '--top-p', '1.0', '--top-k', '0', '--min-p', '0.0',
             '--host', '127.0.0.1', '--port', "$Port")
+
+if ($Parallel -gt 1) { $common += '-kvu' }   # one shared KV cache for all chats: same VRAM as -Parallel 1
 
 if ($Quality) {
     if (-not $Ctx) { $Ctx = 16384 }

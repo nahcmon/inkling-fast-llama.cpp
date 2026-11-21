@@ -21,6 +21,21 @@ out of the box llama.cpp keeps more experts on the CPU.
 
 `llama-bench` (folded model, `-ub 512`): pp512 2330 tok/s, tg128 80 tok/s; at 16k depth pp512 1890 tok/s, tg128 70 tok/s.
 
+### Several chats at once
+
+`run-inkling.ps1 -Parallel N` serves N chats from one shared 64k KV cache (`-np N -kvu`), so VRAM stays at 12.0 GB for
+any N. End-to-end HTTP benchmark, 256 tokens per chat, all chats started together:
+
+| chats | tok/s each chat sees | total tok/s | VRAM |
+|---:|---:|---:|---:|
+| 1 | 77.8 | 75.5 | 11.9 GB |
+| 2 | 57.3 | 108.7 | 12.0 GB |
+| 4 | 38.3 | 146.6 | 12.0 GB |
+| 8 | 25.6 | **195.7** | 12.0 GB |
+
+`llama-batched-bench` (decode only, no HTTP or prompt processing) reaches 124 / 174 / 237 tok/s at 2 / 4 / 8 chats.
+Before the MoE kernel fix below it was 82 / 98 / 98.
+
 ## How the speedup was made
 
 The original model is 15.5 GB, so on a 12 GB card part of the experts run on the CPU, and every token waits for system
@@ -41,8 +56,15 @@ RAM. Most of the gain comes from making it fit; the rest from cutting the number
 6. **Fused glue kernels** (`ggml/src/ggml-cuda/inkling2.cu`, `inkling.cu`): the SiTU activation, the short
    convolution with its state update and residual add, the decode-time dynamic K/V convolution and the row L2 clip each
    run as one kernel instead of 6-11 small ops. +6.5% decode, +10% prefill, bit-exact.
-7. **Server settings:** `-lm none` loads the model straight into VRAM (no 10 GB memory-mapped copy in RAM),
-   `--cache-ram 0` turns off the RAM prompt cache, q4_0 KV cache, `-ub 512`.
+7. **Faster MoE kernel for several chats** (`ggml/src/ggml-cuda/mmvq.cu`): when the per-expert scale of the NVFP4
+   down projection was fused into the expert matmul, the kernel still carried the unused gate accumulators. With
+   more than one token per expert that made it 50x slower (2.2 ms per call at 8 chats). It now has a gate-free
+   variant: 8 chats went from 98 to 237 tok/s, one chat is unchanged, output identical (same perplexity).
+8. **Server settings:** `-lm none` loads the model straight into VRAM (no 10 GB memory-mapped copy in RAM),
+   `--cache-ram 0` turns off the RAM prompt cache, q4_0 KV cache, `-ub 512`. `--ctx-checkpoints 2`: Inkling keeps a
+   sliding-window and recurrent state that the server snapshots (~50 MB each) to resume a chat; the default of 32
+   per chat let RAM grow by ~400 MB per round with 4 long chats (1.3 to 6 GB). Two per chat is enough to resume the
+   next turn without reprocessing, and RAM stays flat.
 
 Every engine change was checked against reference logits (KLD, top-1 agreement); none of them changed the output
 beyond float rounding.
@@ -66,6 +88,7 @@ Put the GGUF next to the scripts (or pass `-ModelDir`), then:
 .\inkling-fast\stop-inkling.ps1
 ```
 
-Options: `-Ctx 32768`, `-Foreground`, `-Port`, `-CacheRam 4096` (keep older chats in RAM), `-Engine <llama-server.exe>`.
+Options: `-Parallel 4` (4 chats at once, shared KV cache, no extra VRAM), `-Ctx 32768`, `-Foreground`, `-Port`,
+`-CacheRam 4096` (keep older chats in RAM), `-Engine <llama-server.exe>`.
 
 Debug switches: `INKLING2_NO_FORK_FUSE=1` turns the glue fusions off, `INKLING2_FUSE_STATS=1` logs which ones fire.

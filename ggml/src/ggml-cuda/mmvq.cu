@@ -882,7 +882,7 @@ static __global__ void mul_mat_vec_q(
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool has_gate = true>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -903,7 +903,7 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
+    const bool shared_expert = has_fusion && has_gate && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     if (shared_expert) {
         vx = fusion.shared_up;
         dst = fusion.shared_dst;
@@ -921,7 +921,7 @@ static __global__ void mul_mat_vec_q_moe(
     float         glu_limit  = 0.0f;
 
     if constexpr (has_fusion) {
-        use_gate   = fusion.gate != nullptr;
+        use_gate   = has_gate && fusion.gate != nullptr;
         vgate      = shared_expert ? fusion.shared_gate : fusion.gate;
         x_bias     = (const float *) fusion.x_bias;
         gate_bias  = (const float *) fusion.gate_bias;
@@ -1098,7 +1098,14 @@ static void mul_mat_vec_q_moe_launch(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
 
-    if (has_fusion) {
+    if (has_fusion && fusion.gate == nullptr && fusion.shared_up == nullptr) {
+        // scale/bias only: a gate-free instantiation avoids the second accumulator set
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, false>, launch_params,
+            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride);
+    } else if (has_fusion) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
