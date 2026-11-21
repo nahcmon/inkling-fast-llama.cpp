@@ -53,6 +53,7 @@
 #include "ggml-cuda/sleep.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/inkling.cuh"
+#include "ggml-cuda/inkling2.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
@@ -4526,6 +4527,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // Inkling 2 glue chains (ported from realugbun/llama.cpp inkling2-speed)
+    static const bool inkling2_fuse = getenv("INKLING2_NO_FORK_FUSE") == nullptr;
+    if (inkling2_fuse && cuda_ctx->stream_context().concurrent_events.empty()) {
+        ggml_cuda_inkling2_args inkling2;
+        // INKLING2_FUSE_MASK: bit t enables fusion type t (debugging). By default all but CLIP: the row L2 clip already
+        // runs fused (inkling.cu), so the glue-chain CLIP is no faster and would change the rounding
+        static const unsigned inkling2_mask = getenv("INKLING2_FUSE_MASK") ?
+            (unsigned) strtoul(getenv("INKLING2_FUSE_MASK"), nullptr, 0) : ~(1u << GGML_CUDA_INKLING2_CLIP);
+        if (ggml_cuda_inkling2_match(cgraph, i, inkling2) && ((inkling2_mask >> inkling2.type) & 1)) {
+            static bool seen[32] = {};
+            if (getenv("INKLING2_FUSE_STATS") && !seen[inkling2.type]) {
+                seen[inkling2.type] = true;
+                fprintf(stderr, "inkling2 fusion %d fired (%d nodes, ne1=%lld)\n", (int) inkling2.type, inkling2.n_nodes,
+                        (long long) inkling2.dst->ne[1]);
+            }
+            ggml_cuda_inkling2_fused(*cuda_ctx, inkling2);
+            return inkling2.n_nodes - 1;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&

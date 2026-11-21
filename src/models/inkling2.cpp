@@ -413,6 +413,11 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
+    if (dynamic) {
+        // the taps first, so that the convolution stays one run of nodes
+        ggml_build_forward_expand(gf, dynamic);
+    }
+
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
@@ -428,7 +433,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         ggml_tensor * coef = ggml_add(ctx0, ggml_reshape_3d(ctx0, weight, n_conv, n_channels/n_heads, n_heads),
                                             ggml_reshape_3d(ctx0, dynamic, n_conv, 1, n_heads));
         ggml_tensor * out = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_reshape_3d(ctx0, x, n_conv, n_channels/n_heads, n_heads), coef));
-        return ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+        out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+        // right after the state store, so that the convolution is one run of nodes that backends can fuse
+        ggml_build_forward_expand(gf, out);
+        return out;
     }
 
     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
@@ -453,6 +461,8 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     }
 
     if (fold) {
+        // right after the state store, so that the convolution is one run of nodes that backends can fuse
+        ggml_build_forward_expand(gf, out);
         return out;
     }
 
@@ -843,6 +853,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             blocks.push_back(inpSA);
         } else {
             cur = ggml_add(ctx0, inpSA, cur);
+            // right after the convolution, so that backends can fuse the residual into it
+            ggml_build_forward_expand(gf, cur);
         }
 
         ggml_tensor * ffn_inp = cur;
@@ -881,6 +893,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, ffn_inp, cur);
+        ggml_build_forward_expand(gf, cur);
         cb(cur, "l_out", il);
     }
 
