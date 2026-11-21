@@ -1,5 +1,6 @@
 ﻿# Inkling-2-Mini launcher for RTX 3080 Ti (12 GB) + Ryzen 5 5600X
-# Starts an OpenAI-compatible server + web UI at http://127.0.0.1:8080 in the background.
+# Starts an OpenAI-compatible server + web UI on port 8080 in the background, reachable from every
+# device on your local network (phone, laptop, ...). Use -LocalOnly to keep it on this PC only.
 # Stop it with .\stop-inkling.ps1
 #
 #   .\run-inkling.ps1                  # FAST mode (default): whole model in VRAM, 64k context
@@ -17,6 +18,9 @@
 #    and the server's RAM prompt cache is off, so the server itself uses ~1 GB of system RAM.
 #    Each chat keeps only its 2 newest state snapshots (--ctx-checkpoints 2, ~50 MB each) instead of 32,
 #    so RAM stays flat in long chats and with -Parallel (enough to resume the next turn without reprocessing).
+#  - Network: there is no password. Anyone on your Wi-Fi/LAN can use the chat while it runs; use -LocalOnly on
+#    untrusted networks. If other devices can't connect, allow llama-server.exe in the Windows Firewall prompt
+#    (Private networks) - it appears the first time.
 #  - Log file: inkling-server.log next to this script.
 param(
     [int]$Ctx = 0,
@@ -24,7 +28,8 @@ param(
     [switch]$Foreground,
     [int]$Port = 8080,
     [int]$CacheRam = 0,
-    [int]$Parallel = 1
+    [int]$Parallel = 1,
+    [switch]$LocalOnly
 )
 
 $exe = (Resolve-Path $Engine).Path   # custom build: fused Inkling kernels
@@ -39,7 +44,7 @@ if (Test-Path $pidFile) {
 $common = @('--jinja', '-ngl', '99', '--fit', 'off', '-fa', 'on', '-np', "$Parallel", '--ctx-checkpoints', '2',
             '-lm', 'none', '--cache-ram', "$CacheRam",
             '--temp', '1.0', '--top-p', '1.0', '--top-k', '0', '--min-p', '0.0',
-            '--host', '127.0.0.1', '--port', "$Port")
+            '--host', $(if ($LocalOnly) { '127.0.0.1' } else { '0.0.0.0' }), '--port', "$Port")
 
 if ($Parallel -gt 1) { $common += '-kvu' }   # one shared KV cache for all chats: same VRAM as -Parallel 1
 
@@ -72,4 +77,9 @@ while ($true) {
 }
 Write-Host " ready." -ForegroundColor Green
 Write-Host "Web UI / API: http://127.0.0.1:$Port   (OpenAI API base: http://127.0.0.1:$Port/v1)"
+if (-not $LocalOnly) {
+    $lan = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+           Where-Object { $_.PrefixOrigin -in 'Dhcp', 'Manual' -and $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -ne '127.0.0.1' -and $_.InterfaceAlias -notlike 'vEthernet*' }
+    foreach ($a in $lan) { Write-Host "From other devices on your network: http://$($a.IPAddress):$Port   ($($a.InterfaceAlias))" -ForegroundColor Cyan }
+}
 Write-Host "Stop with: .\stop-inkling.ps1"
