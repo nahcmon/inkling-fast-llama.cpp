@@ -1115,9 +1115,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "SLEEP",
+    "DEPTH_MIX",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1231,9 +1232,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "sleep(x)",
+    "depth_mix(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6251,6 +6253,44 @@ struct ggml_tensor * ggml_sleep(
 
     result->op     = GGML_OP_SLEEP;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_depth_mix
+
+struct ggml_tensor * ggml_depth_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * seg_a,
+        struct ggml_tensor  * seg_b,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * query,
+        float                 scale,
+        float                 eps) {
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = ggml_nelements(cur)/n_embd;
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && query->type == GGML_TYPE_F32);
+    GGML_ASSERT(query->ne[0] == n_embd && query->ne[2] == 1 && query->ne[3] == 1);
+    GGML_ASSERT(cur->nb[0] == sizeof(float) && query->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous_rows(cur));
+    struct ggml_tensor * segs[2] = { seg_a, seg_b };
+    for (int i = 0; i < 2; ++i) {
+        if (segs[i]) {
+            GGML_ASSERT(segs[i]->type == GGML_TYPE_F32 && segs[i]->nb[0] == sizeof(float));
+            GGML_ASSERT(segs[i]->ne[0] == n_embd && segs[i]->ne[2] == n_tokens && segs[i]->ne[3] == 1);
+        }
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens);
+
+    float params[] = { scale, eps };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DEPTH_MIX;
+    result->src[0] = cur;
+    result->src[1] = query;
+    result->src[2] = seg_a;
+    result->src[3] = seg_b;
 
     return result;
 }

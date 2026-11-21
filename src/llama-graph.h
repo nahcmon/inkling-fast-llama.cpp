@@ -816,6 +816,11 @@ public:
     uint32_t n_kv_banded[2] = { 0, 0 };
     bool     banded         = false;
 
+    // banded attention over a ring-buffer SWA cache: the window's cells gathered in position order
+    uint32_t      n_kv_gather_swa   = 0;
+    ggml_tensor * swa_gather_idxs   = nullptr; // I32 [n_kv_gather_swa]
+    ggml_tensor * swa_gather_mask   = nullptr; // F16 [n_kv_gather_swa, n_tokens]
+
     const uint32_t extent;
     const uint32_t extent_swa;
 

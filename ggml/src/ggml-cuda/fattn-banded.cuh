@@ -5,3 +5,5 @@
 void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * dst);
+
+size_t ggml_cuda_flash_attn_ext_banded_get_alloc_size(int device, const ggml_tensor * dst);

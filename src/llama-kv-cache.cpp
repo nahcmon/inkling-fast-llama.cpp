@@ -1358,6 +1358,72 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const 
     return pos_max + 1;
 }
 
+uint32_t llama_kv_cache::get_pos_gather(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_window, int32_t * idxs) const {
+    if (n_window == 0 || sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0 ||
+        ubatch.pos == nullptr || ubatch.n_seq_id == nullptr ||
+        ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr) {
+        return 0;
+    }
+
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return 0;
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    if (sinfo.strm[0] < 0 || (uint32_t) sinfo.strm[0] != stream || stream >= v_cells.size()) {
+        return 0;
+    }
+
+    // the ubatch must be the monotonic tail of the sequence
+    const llama_pos p0 = ubatch.pos[0];
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.pos[i] != p0 + (llama_pos) i ||
+            ubatch.n_seq_id[i] < 1 || ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != seq_id) {
+            return 0;
+        }
+    }
+
+    const auto & cells = v_cells[stream];
+    const llama_pos p_max = p0 + (llama_pos) ubatch.n_tokens - 1;
+    if (cells.seq_pos_max(seq_id) != p_max) {
+        return 0;
+    }
+
+    const llama_pos p_start = std::max<llama_pos>(0, p0 - (llama_pos) n_window + 1);
+    const uint32_t  n       = p_max + 1 - p_start;
+    if (n > cells.size()) {
+        return 0;
+    }
+
+    std::vector<int32_t> tmp;
+    int32_t * out = idxs;
+    if (!out) {
+        tmp.assign(n, -1);
+        out = tmp.data();
+    } else {
+        std::fill(out, out + n, -1);
+    }
+
+    uint32_t found = 0;
+    for (uint32_t c = 0; c < cells.size(); ++c) {
+        if (cells.is_empty(c) || !cells.seq_has(c, seq_id)) {
+            continue;
+        }
+        const llama_pos p = cells.pos_get(c);
+        if (p < p_start || p > p_max) {
+            continue;
+        }
+        if (out[p - p_start] >= 0) {
+            return 0; // duplicate position
+        }
+        out[p - p_start] = (int32_t) c;
+        ++found;
+    }
+
+    return found == n ? n : 0;
+}
+
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
     if (ubatch.n_seqs_unq == 1) {
         return 1;
@@ -3148,6 +3214,43 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
 
     const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
     return result <= (uint32_t) n_kv ? result : 0;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_pos_gather(uint32_t n_window) const {
+    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
+        // reserve: the gathered window is at most the whole view
+        if (kv != nullptr && lctx == nullptr && kv->get_n_stream() == 1) {
+            return n_kv;
+        }
+        return 0;
+    }
+
+    return kv->get_pos_gather(sinfos[i_cur], ubatches[i_cur], n_window, nullptr);
+}
+
+void llama_kv_cache_context::set_input_pos_gather(ggml_tensor * idxs, ggml_tensor * mask, const llama_ubatch * ubatch, uint32_t n_window) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(idxs->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
+
+    const int64_t n   = idxs->ne[0];
+    int32_t     * dst = (int32_t *) idxs->data;
+    ggml_fp16_t * m   = (ggml_fp16_t *) mask->data;
+
+    const uint32_t got = kv->get_pos_gather(sinfos[i_cur], *ubatch, n_window, dst);
+    GGML_ASSERT((int64_t) got == n);
+
+    // key j holds position p_start + j, query i position p0 + i
+    const int64_t p0      = ubatch->pos[0];
+    const int64_t p_start = p0 + (int64_t) ubatch->n_tokens - n;
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+    for (int64_t i = 0; i < mask->ne[1]; ++i) {
+        const int64_t pq = p0 + i;
+        for (int64_t j = 0; j < n; ++j) {
+            const int64_t pk = p_start + j;
+            m[i*mask->ne[0] + j] = (i < (int64_t) ubatch->n_tokens && pk <= pq && pq - pk < (int64_t) n_window) ? zero : ninf;
+        }
+    }
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {

@@ -702,6 +702,10 @@ struct llama_layer {
     struct ggml_tensor * loop_down[4]     = {};
     struct ggml_tensor * loop_gain[4]     = {};
     struct ggml_tensor * loop_forget[4]   = {};
+    struct ggml_tensor * loop_qkv_down    = nullptr; // inkling2 fast fold: stacked q/k/v controllers
+    struct ggml_tensor * loop_qkv_gf      = nullptr;
+    struct ggml_tensor * loop_mlp_gf      = nullptr;
+    struct ggml_tensor * attn_qkv_inp_norm = nullptr;
     struct ggml_tensor * attn_q_inp_norm  = nullptr;
     struct ggml_tensor * attn_k_inp_norm  = nullptr;
     struct ggml_tensor * attn_v_inp_norm  = nullptr;

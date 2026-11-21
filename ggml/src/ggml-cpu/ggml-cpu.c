@@ -2038,6 +2038,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_sleep(params, tensor);
             } break;
+        case GGML_OP_DEPTH_MIX:
+            {
+                ggml_compute_forward_depth_mix(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_EXT_BANDED:
             {

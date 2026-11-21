@@ -28,6 +28,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fattn-banded.cuh"
+#include "ggml-cuda/depthmix.cuh"
 #include "ggml-cuda/fp8.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -51,6 +52,7 @@
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/sleep.cuh"
 #include "ggml-cuda/snake.cuh"
+#include "ggml-cuda/inkling.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
@@ -90,6 +92,7 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <cstdarg>
@@ -1305,9 +1308,9 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
-    size_t size = (tensor->op == GGML_OP_FLASH_ATTN_EXT || tensor->op == GGML_OP_FLASH_ATTN_EXT_BANDED)
-        ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
-        : ggml_nbytes(tensor);
+    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT        ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor) :
+                  tensor->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? ggml_cuda_flash_attn_ext_banded_get_alloc_size(buft_ctx->device, tensor) :
+                  ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
     // [TAG_ALLOC_SIZE_EXPAND]
@@ -3203,6 +3206,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SLEEP:
             ggml_cuda_op_sleep(ctx, dst);
             break;
+        case GGML_OP_DEPTH_MIX:
+            ggml_cuda_op_depth_mix(ctx, dst);
+            break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
@@ -4581,6 +4587,51 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Inkling-2 row L2 clip: [mul(x, s)] -> sqr -> sum_rows -> sqrt -> scale -> fill -> div -> clamp -> mul
+    if (node->op == GGML_OP_MUL || node->op == GGML_OP_SQR) {
+        static const ggml_op clip_ops[] = { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
+                                            GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL };
+        const bool has_scale = node->op == GGML_OP_MUL;
+        const int  o         = has_scale ? 1 : 0;
+        const int  n_ops     = 8 + o;
+        const int  out_idx   = i + n_ops - 1;
+        if (i + n_ops <= cgraph->n_nodes && ggml_can_fuse_subgraph(cgraph, i, n_ops, clip_ops + (1 - o), &out_idx, 1)) {
+            const ggml_tensor * sqr   = cgraph->nodes[i + o];
+            const ggml_tensor * sum   = cgraph->nodes[i + o + 1];
+            const ggml_tensor * sq    = cgraph->nodes[i + o + 2];
+            const ggml_tensor * sb    = cgraph->nodes[i + o + 3];
+            const ggml_tensor * fill  = cgraph->nodes[i + o + 4];
+            const ggml_tensor * div   = cgraph->nodes[i + o + 5];
+            const ggml_tensor * clamp = cgraph->nodes[i + o + 6];
+            ggml_tensor *       mul   = cgraph->nodes[i + o + 7];
+
+            const ggml_tensor * cur = sqr->src[0];
+            const ggml_tensor * x   = cur;
+            const ggml_tensor * s   = nullptr;
+            bool ok = true;
+            if (has_scale) {
+                ok = cur == node;
+                x  = ggml_are_same_shape(node, node->src[0]) ? node->src[0] : node->src[1];
+                s  = x == node->src[0] ? node->src[1] : node->src[0];
+                ok = ok && ggml_are_same_shape(node, x) && s->type == GGML_TYPE_F32 && ggml_is_contiguous(s) &&
+                     s->ne[0] == x->ne[0] && s->ne[2] == 1 && s->ne[3] == 1 && x->ne[1] % s->ne[1] == 0;
+            }
+            ok = ok && sum->src[0] == sqr && sq->src[0] == sum && sb->src[0] == sq && fill->src[0] == sb &&
+                 div->src[0] == fill && div->src[1] == sb && clamp->src[0] == div &&
+                 mul->src[0] == cur && mul->src[1] == clamp &&
+                 x->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && sum->type == GGML_TYPE_F32 &&
+                 ggml_is_contiguous(x) && ggml_is_contiguous(mul) && ggml_are_same_shape(x, mul) &&
+                 x->ne[0] <= 4096;
+            if (ok && ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, &out_idx, 1)) {
+                ggml_cuda_op_inkling_clip(*cuda_ctx, x, s,
+                        ggml_get_op_params_f32(fill, 0),
+                        ggml_get_op_params_f32(sb, 0), ggml_get_op_params_f32(sb, 1),
+                        ggml_get_op_params_f32(clamp, 0), ggml_get_op_params_f32(clamp, 1), mul);
+                return n_ops - 1;
+            }
+        }
+    }
+
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
@@ -5357,8 +5408,74 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// GGML_CUDA_OP_PROF=1 (with GGML_CUDA_DISABLE_GRAPHS=1): per-op GPU time, printed at exit
+struct ggml_cuda_op_prof {
+    bool enabled = false;
+    std::map<std::string, std::pair<double, int64_t>> acc;
+    std::vector<std::tuple<std::string, cudaEvent_t, cudaEvent_t>> pending;
+    ggml_cuda_op_prof() {
+        const char * e = getenv("GGML_CUDA_OP_PROF");
+        enabled = e && atoi(e) != 0;
+    }
+    void flush() {
+        for (auto & [key, a, b] : pending) {
+            CUDA_CHECK(cudaEventSynchronize(b));
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
+            auto & s = acc[key];
+            s.first += ms;
+            s.second += 1;
+            CUDA_CHECK(cudaEventDestroy(a));
+            CUDA_CHECK(cudaEventDestroy(b));
+        }
+        pending.clear();
+    }
+    ~ggml_cuda_op_prof() {
+        if (!enabled || acc.empty()) {
+            return;
+        }
+        std::vector<std::pair<std::string, std::pair<double, int64_t>>> v(acc.begin(), acc.end());
+        std::sort(v.begin(), v.end(), [](auto & x, auto & y) { return x.second.first > y.second.first; });
+        double tot = 0.0;
+        for (auto & x : v) {
+            tot += x.second.first;
+        }
+        fprintf(stderr, "\n==== CUDA op profile: total %.1f ms ====\n", tot);
+        for (size_t i = 0; i < v.size() && i < 60; ++i) {
+            fprintf(stderr, "%9.1f ms %5.1f%% %8lld  %s\n", v[i].second.first, 100.0*v[i].second.first/tot,
+                    (long long) v[i].second.second, v[i].first.c_str());
+        }
+    }
+};
+static ggml_cuda_op_prof g_cuda_op_prof;
+
+static std::string ggml_cuda_op_prof_key(const ggml_tensor * node, int n_fused) {
+    std::string name = node->name;
+    size_t p = name.find_last_of('-');
+    if (p != std::string::npos && p + 1 < name.size() && isdigit((unsigned char) name[p + 1])) {
+        name = name.substr(0, p);
+    }
+    if (name.rfind("node_", 0) == 0) {
+        name = "";
+    }
+    std::string key = std::string(ggml_op_name(node->op)) + " " + name + " {" + std::to_string(node->ne[0]) + "," +
+        std::to_string(node->ne[1]) + "," + std::to_string(node->ne[2]) + "," + std::to_string(node->ne[3]) + "}" +
+        (ggml_is_contiguous(node->src[0] ? node->src[0] : node) ? "" : " nc0") +
+        (node->src[1] && !ggml_is_contiguous(node->src[1]) ? " nc1" : "");
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        key += std::string(" [") + ggml_type_name(node->src[0]->type) + " " + std::to_string(node->src[0]->ne[0]) + "x" +
+            std::to_string(node->src[0]->ne[1]) + "]";
+    }
+    if (n_fused) {
+        key = "FUSED+" + std::to_string(n_fused) + " " + key;
+    }
+    return key;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    const bool prof = g_cuda_op_prof.enabled && !use_cuda_graph;
+    cudaEvent_t prof_a = nullptr;
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -5513,7 +5630,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (prof) {
+                    CUDA_CHECK(cudaEventCreate(&prof_a));
+                    CUDA_CHECK(cudaEventRecord(prof_a, cuda_ctx->stream()));
+                }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                if (prof && nodes_to_skip != 0) {
+                    cudaEvent_t b;
+                    CUDA_CHECK(cudaEventCreate(&b));
+                    CUDA_CHECK(cudaEventRecord(b, cuda_ctx->stream()));
+                    g_cuda_op_prof.pending.emplace_back(ggml_cuda_op_prof_key(node, nodes_to_skip), prof_a, b);
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -5547,6 +5675,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (prof) {
+                    cudaEvent_t b;
+                    CUDA_CHECK(cudaEventCreate(&b));
+                    CUDA_CHECK(cudaEventRecord(b, cuda_ctx->stream()));
+                    g_cuda_op_prof.pending.emplace_back(ggml_cuda_op_prof_key(node, 0), prof_a, b);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -5571,6 +5705,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
+            if (prof) {
+                g_cuda_op_prof.flush();
+            }
         }
     }
 
@@ -6874,6 +7011,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_DEPTH_MIX:
+            return ggml_cuda_depth_mix_supported(op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
         case GGML_OP_SLEEP:

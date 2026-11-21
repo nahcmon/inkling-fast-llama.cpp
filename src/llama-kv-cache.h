@@ -197,6 +197,10 @@ public:
     // active cell count when position p lives in physical cell p; 0 for any non-contiguous layout
     uint32_t get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const;
 
+    // sliding window: the cells of positions [p0 - n_window + 1, p_max] in position order, gathered for banded
+    // attention over a ring-buffer cache; returns their count (0 = not available) and fills idxs if given
+    uint32_t get_pos_gather(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_window, int32_t * idxs) const;
+
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each
     // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
@@ -425,6 +429,8 @@ public:
 
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_pos_contiguous() const;
+    uint32_t get_n_kv_pos_gather(uint32_t n_window) const;
+    void     set_input_pos_gather(ggml_tensor * idxs, ggml_tensor * mask, const llama_ubatch * ubatch, uint32_t n_window) const;
     uint32_t get_n_kv_rows() const;
     uint32_t get_size() const;
 

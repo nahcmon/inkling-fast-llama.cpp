@@ -81,7 +81,9 @@ void llama_model_dflash::load_tensors_dspark(int64_t n_vocab_draft) {
 
     const int64_t dspark_markov_rank = ml->get_tensor_meta("markov_w1.weight")->ne[0];
 
-    dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
+    // rows are gathered by token id, so a vocab-padded table (e.g. Inkling: 201024 rows for 200058 tokens) works as is
+    const int64_t dspark_markov_rows = std::max<int64_t>(n_vocab, ml->get_tensor_meta("markov_w1.weight")->ne[1]);
+    dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, dspark_markov_rows }, 0);
     dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, 0);
     dspark_markov_w2_s = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
 

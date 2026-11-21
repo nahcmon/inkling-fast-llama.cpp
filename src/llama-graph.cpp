@@ -1431,6 +1431,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
 
+    if (swa_gather_idxs && swa_gather_idxs->buffer) {
+        attn_ctx->get_swa()->set_input_pos_gather(swa_gather_idxs, swa_gather_mask, ubatch, extent_swa);
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1478,6 +1482,9 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     if (banded) {
         res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
         res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
+        if (n_kv_banded[1] == 0) {
+            res &= attn_ctx->get_swa()->get_n_kv_pos_gather(extent_swa) == n_kv_gather_swa;
+        }
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
@@ -4514,6 +4521,16 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
+    if (cparams.flash_attn && kq_b->type == GGML_TYPE_F16 && kq_mask->type == GGML_TYPE_F16) {
+        // an F16 bias adds to the F16 mask directly: the mask holds 0 or -inf, so this matches the F32 round trip
+        if (kq_b->ne[1] != kq_mask->ne[1]) {
+            kq_mask = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], kq_b->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i_row*kq_mask->nb[1]);
+        }
+        kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+        cb(kq_mask, "kq_mask_rel_pos", il);
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+    }
     if (kq_b->ne[1] != kq_mask->ne[1]) {
         ggml_tensor *& dev = inp->self_kq_mask_dev[is_swa];
         if (!dev) {

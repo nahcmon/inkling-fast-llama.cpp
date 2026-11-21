@@ -433,6 +433,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_SLEEP,
+        GGML_OP_DEPTH_MIX,
 
         GGML_OP_COUNT,
     };
@@ -2250,6 +2251,19 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // softmax attention over a stack of depth states, one learned query per output row:
+    //   states = [seg_a rows, seg_b rows, rms_norm(cur)], seg_* are [n_embd, n_*, n_tokens] (rows contiguous, may be NULL)
+    //   cur: [n_embd, n_tokens], query: [n_embd, n_q]
+    //   result[:, q, t] = sum_j softmax_j(scale * dot(query[:, q], states_j[:, t])) * states_j[:, t]  -> [n_embd, n_q, n_tokens]
+    GGML_API struct ggml_tensor * ggml_depth_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * seg_a,
+            struct ggml_tensor  * seg_b,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * query,
+            float                 scale,
+            float                 eps);
 
     // flash attention with an additive banded relative-position bias, applied after scale, no dense bias tensor:
     //   rel_logits: [rel_extent, n_head, n_batch, ne3]; rel_dist = q_idx + (n_kv - n_batch) - kv_idx

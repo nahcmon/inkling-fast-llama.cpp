@@ -6,6 +6,7 @@
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
+#include <cstdlib>
 #include <map>
 
 class llama_memory_hybrid_idx_context;
@@ -2489,12 +2490,29 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
                 int64_t offset);
+
+        // fast path: normalized, concatenated block prefixes shared between mix() calls
+        bool fast = std::getenv("INKLING_SLOW") == nullptr;
+        std::map<std::vector<ggml_tensor *>, ggml_tensor *> mix_prefix;
+        std::map<ggml_tensor *, ggml_tensor *>              mix_normed;
+        ggml_tensor * mix_states(const std::vector<ggml_tensor *> & blocks);
+        // fused path: every normalized block lives in one slot of a shared bank, mix() reads up to two slot runs in place
+        bool fused_mix = std::getenv("INKLING_NO_FUSED_MIX") == nullptr;
+        ggml_tensor * mix_bank = nullptr;
+        int           mix_bank_used = 0;
+        std::map<ggml_tensor *, int> mix_slot;
+        int mix_slot_of(ggml_tensor * block);
+        // one contiguous banded-attention mask per graph (global / SWA), shared by every layer
+        ggml_tensor * banded_mask[2] = { nullptr, nullptr };
+        ggml_tensor * control_stacked(ggml_tensor * curs, ggml_tensor * msgs, ggml_tensor * down, ggml_tensor * gf);
+        // cont() only when the view is not already contiguous
+        ggml_tensor * cont_if(ggml_tensor * t) { return fast && ggml_is_contiguous(t) ? t : ggml_cont(ctx0, t); }
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
-struct llama_model_lfm2 : public llama_model_base {
+struct llama_model_lfm2: public llama_model_base {
     llama_model_lfm2(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;

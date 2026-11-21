@@ -280,6 +280,7 @@ struct llama_hparams {
     uint32_t loop_core_end   = 0;
     uint32_t loop_n_pass     = 0; // < 2: no loop
     uint32_t loop_gate_rank  = 0; // inkling2
+    uint32_t inkling_fold    = 0; // inkling2: conv residual/scale folded into the weights, stacked controllers
 
     bool ssm_dt_b_c_rms = false;
 

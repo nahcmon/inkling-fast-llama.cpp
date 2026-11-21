@@ -141,7 +141,13 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
-    if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
+    if (dim < 2 && dst->ne[3] > 1 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        // dims 2 and 3 fold into one: a single launch instead of one per i3
+        concat_cont_cuda((const T *) src0->data, (const T *) src1->data, (T *) dst->data,
+                ggml_row_size(src0->type, src0->ne[0])/sizeof(T), src0->ne[1], src0->ne[2]*src0->ne[3],
+                ggml_row_size(dst->type, dst->ne[0])/sizeof(T),  dst->ne[1],  dst->ne[2]*dst->ne[3], dim, stream);
+    } else if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1) &&
+               (dst->ne[3] <= 4 || ggml_is_quantized(src0->type))) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
         T *       dst_d  = (T *) dst->data;

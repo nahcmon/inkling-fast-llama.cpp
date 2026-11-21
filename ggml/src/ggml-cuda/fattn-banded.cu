@@ -2,6 +2,7 @@
 #include "convert.cuh"
 #include "fattn-banded.cuh"
 #include "fattn.cuh"
+#include "fattn-common.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -856,9 +857,14 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     if (!q || !k || !v || !rel || q->type != GGML_TYPE_F32) {
         return false;
     }
-    if (!fattn_banded_type_supported(k->type) ||
-        !fattn_banded_type_supported(v->type) ||
-        !fattn_banded_type_supported(rel->type)) {
+    // quantized K/V (e.g. a q4_0 cache) only via the MMA kernel, which dequantizes them to f16 first
+    const ggml_tensor * sinks_t = dst->src[4];
+    const bool kv_dequant_ok = sinks_t && q->ne[1] >= 16 && turing_mma_available(ggml_cuda_info().devices[device].cc);
+    auto kv_ok = [&](const ggml_tensor * t) {
+        return fattn_banded_type_supported(t->type) ||
+            (kv_dequant_ok && ggml_is_quantized(t->type) && ggml_get_to_fp16_nc_cuda(t->type) != nullptr);
+    };
+    if (!kv_ok(k) || !kv_ok(v) || !fattn_banded_type_supported(rel->type)) {
         return false;
     }
     if ((q->ne[0] != 64 && q->ne[0] != 128) || v->ne[0] != q->ne[0] || k->ne[0] != q->ne[0]) {
@@ -911,7 +917,8 @@ static bool fattn_banded_mma_usable(const int device, const ggml_tensor * dst) {
         return false;
     }
     for (const ggml_tensor * t : {k, v}) {
-        if (t->type == GGML_TYPE_F16 ? !fattn_banded_mma_aligned(t) : t->type != GGML_TYPE_BF16) {
+        if (t->type == GGML_TYPE_F16 ? !fattn_banded_mma_aligned(t) :
+                (t->type != GGML_TYPE_BF16 && !((ggml_is_quantized(t->type) || t->type == GGML_TYPE_F32) && ggml_get_to_fp16_nc_cuda(t->type)))) {
             return false;
         }
     }
@@ -935,24 +942,29 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     const char * v_data = (const char *) v->data;
     uint64_t k_nb[4] = {k->nb[0], k->nb[1], k->nb[2], k->nb[3]};
     uint64_t v_nb[4] = {v->nb[0], v->nb[1], v->nb[2], v->nb[3]};
-    ggml_cuda_pool_alloc<half> k_f16(ctx.pool());
-    ggml_cuda_pool_alloc<half> v_f16(ctx.pool());
-    auto to_f16 = [&](const ggml_tensor * t, ggml_cuda_pool_alloc<half> & buf, const char *& data, uint64_t (&nb)[4]) {
+    // f16 copies of non-f16 K/V go into the space reserved behind dst in the compute buffer (see get_alloc_size)
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, true, true);
+    auto to_f16 = [&](const ggml_tensor * t, uintptr_t buf, const char *& data, uint64_t (&nb)[4]) {
         if (t->type == GGML_TYPE_F16) {
             return;
         }
+        GGML_ASSERT(buf != 0);
         const size_t ts = ggml_type_size(t->type);
-        buf.alloc(ggml_nelements(t));
-        ggml_get_to_fp16_nc_cuda(t->type)(t->data, buf.get(), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+        ggml_get_to_fp16_nc_cuda(t->type)(t->data, (half *) buf, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
             t->nb[1]/ts, t->nb[2]/ts, t->nb[3]/ts, stream);
-        data  = (const char *) buf.get();
+        data  = (const char *) buf;
         nb[0] = sizeof(half);
         nb[1] = t->ne[0]*nb[0];
         nb[2] = t->ne[1]*nb[1];
         nb[3] = t->ne[2]*nb[2];
     };
-    to_f16(k, k_f16, k_data, k_nb);
-    to_f16(v, v_f16, v_data, v_nb);
+    to_f16(k, f16_extra.K, k_data, k_nb);
+    if (f16_extra.V == f16_extra.K && v->type != GGML_TYPE_F16) {
+        v_data = k_data;
+        for (int i = 0; i < 4; ++i) { v_nb[i] = k_nb[i]; }
+    } else {
+        to_f16(v, f16_extra.V, v_data, v_nb);
+    }
 
     const int nw = n_q >= 64 ? 4 : (n_q >= 32 ? 2 : 1);
     const int bq = nw*16;
@@ -1039,6 +1051,15 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
                 part.get(), (float *) dst->data, n_rows, q->ne[2], n_q, n_chunks, sinks_d, sinks_s1, sinks_s2);
         }
     }
+}
+
+size_t ggml_cuda_flash_attn_ext_banded_get_alloc_size(int device, const ggml_tensor * dst) {
+    if (ggml_cuda_flash_attn_ext_banded_use_mma(device, dst)) {
+        return ggml_cuda_flash_attn_ext_get_alloc_size(device, dst); // delegated to the generic kernels
+    }
+    const bool mma = dst->src[4] && fattn_banded_mma_usable(device, dst);
+    const ggml_cuda_flash_attn_ext_f16_extra_data e = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, mma, mma);
+    return e.end - (uintptr_t) dst->data;
 }
 
 void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

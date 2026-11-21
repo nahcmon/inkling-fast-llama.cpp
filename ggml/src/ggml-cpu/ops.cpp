@@ -2238,6 +2238,76 @@ void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor *
     }
 }
 
+// ggml_compute_forward_depth_mix
+
+void ggml_compute_forward_depth_mix(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * cur   = dst->src[0];
+    const ggml_tensor * query = dst->src[1];
+    const ggml_tensor * segs[2] = { dst->src[2], dst->src[3] };
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const float eps   = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t nq  = dst->ne[1];
+    const int64_t nt  = dst->ne[2];
+    const int64_t na  = segs[0] ? segs[0]->ne[1] : 0;
+    const int64_t nb  = segs[1] ? segs[1]->ne[1] : 0;
+    const int64_t ns  = na + nb + 1;
+
+    std::vector<float> c(ne0);
+    std::vector<const float *> st(ns);
+    std::vector<float> w(ns);
+
+    for (int64_t t = params->ith; t < nt; t += params->nth) {
+        const float * cr = (const float *) ((const char *) cur->data + (t % cur->ne[1])*cur->nb[1] + (t / cur->ne[1])*cur->nb[2]);
+        double ss = 0.0;
+        for (int64_t i = 0; i < ne0; ++i) {
+            ss += (double) cr[i]*cr[i];
+        }
+        const float r = 1.0f/sqrtf((float) (ss/ne0) + eps);
+        for (int64_t i = 0; i < ne0; ++i) {
+            c[i] = cr[i]*r;
+        }
+        int64_t j = 0;
+        for (int s = 0; s < 2; ++s) {
+            if (!segs[s]) {
+                continue;
+            }
+            for (int64_t k = 0; k < segs[s]->ne[1]; ++k) {
+                st[j++] = (const float *) ((const char *) segs[s]->data + k*segs[s]->nb[1] + t*segs[s]->nb[2]);
+            }
+        }
+        st[j] = c.data();
+
+        for (int64_t q = 0; q < nq; ++q) {
+            const float * qr = (const float *) ((const char *) query->data + q*query->nb[1]);
+            float mx = -INFINITY;
+            for (int64_t k = 0; k < ns; ++k) {
+                float d = 0.0f;
+                for (int64_t i = 0; i < ne0; ++i) {
+                    d += qr[i]*st[k][i];
+                }
+                w[k] = d*scale;
+                mx = std::max(mx, w[k]);
+            }
+            float sum = 0.0f;
+            for (int64_t k = 0; k < ns; ++k) {
+                w[k] = expf(w[k] - mx);
+                sum += w[k];
+            }
+            float * out = (float *) ((char *) dst->data + q*dst->nb[1] + t*dst->nb[2]);
+            for (int64_t i = 0; i < ne0; ++i) {
+                float acc = 0.0f;
+                for (int64_t k = 0; k < ns; ++k) {
+                    acc += w[k]*st[k][i];
+                }
+                out[i] = acc/sum;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_sleep
 
 void ggml_compute_forward_sleep(const ggml_compute_params * params, ggml_tensor * dst) {
