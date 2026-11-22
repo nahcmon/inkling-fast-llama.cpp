@@ -1435,6 +1435,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_pos_gather(swa_gather_idxs, swa_gather_mask, ubatch, extent_swa);
     }
 
+    if (base_gather_idxs && base_gather_idxs->buffer) {
+        attn_ctx->get_base()->set_input_pos_gather(base_gather_idxs, base_gather_mask, ubatch, gather_all);
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1484,6 +1488,9 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
         res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
         if (n_kv_banded[1] == 0) {
             res &= attn_ctx->get_swa()->get_n_kv_pos_gather(extent_swa) == n_kv_gather_swa;
+        }
+        if (n_kv_banded[0] == 0) {
+            res &= attn_ctx->get_base()->get_n_kv_pos_gather(gather_all) == n_kv_gather_base;
         }
     }
 
@@ -2744,6 +2751,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
+        // expert down rows stored zero-padded (e.g. 1152 -> 1280 so 3-bit IQ/K quants can be used): pad the activations too
+        if (down_exps->ne[0] > cur->ne[0]) {
+            cur = ggml_pad(ctx0, cur, down_exps->ne[0] - cur->ne[0], 0, 0, 0);
+        }
         ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);

@@ -2373,6 +2373,7 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
             case LLM_ARCH_QWEN35:
             case LLM_ARCH_QWEN35MOE:
             case LLM_ARCH_QWEN3NEXT:
+            case LLM_ARCH_INKLING2: // experts go through build_lora_mm_id (rotated, padded expert-down input)
                 break;
             default:
                 throw std::runtime_error(format(

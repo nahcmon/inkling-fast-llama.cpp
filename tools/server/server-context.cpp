@@ -396,6 +396,9 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+
+        kv_donor  = -1;
+        kv_shared = 0;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -416,6 +419,17 @@ struct server_slot {
     // realtime transcription, see SERVER_TASK_TYPE_TRANSCRIBE_RT
     mtmd::audio_stream_ptr audio_stream;
     bool audio_wait = false; // the stream needs more audio before it can produce rows
+    bool kv_wait    = false; // started, but held back until the shared KV cache has room for it [TAG_KV_SCHED]
+
+    // [TAG_KV_FORK] shared prompt prefix between slots of the unified KV cache: a slot whose prompt starts like
+    // the prompt of another slot takes that slot's state for the common part instead of computing it again,
+    // and the cells of that part are shared (stored once)
+    int     kv_fork_donor = -1;    // waiting until this slot has processed kv_fork_n tokens, then fork from it
+    int     kv_fork_task  = -1;    // the donor's task id when the wait started
+    int32_t kv_fork_n     = 0;
+    bool    kv_fork_tried = false; // looked for a donor for the current task
+    int     kv_donor      = -1;    // the first kv_shared cells of this slot are shared with this slot
+    int32_t kv_shared     = 0;
     std::deque<int64_t> audio_commit_rows; // end row of each non-final commit not yet completed
 
     // realtime conversation, see SERVER_TASK_TYPE_REALTIME
@@ -1266,7 +1280,8 @@ private:
             mparams.use_gpu          = params_base.mmproj_use_gpu;
             mparams.device           = params_base.mmproj_device;
             mparams.print_timings    = false;
-            mparams.n_threads        = params_base.cpuparams.n_threads;
+            // [TAG_MMPROJ_THREADS] a CPU vision encoder gets -tb threads, so -t can stay low for GPU decode
+            mparams.n_threads        = params_base.mmproj_use_gpu ? params_base.cpuparams.n_threads : params_base.cpuparams_batch.n_threads;
             mparams.flash_attn_type  = params_base.flash_attn_type;
             mparams.warmup           = params_base.warmup;
             mparams.image_min_tokens = params_base.image_min_tokens;
@@ -1850,6 +1865,303 @@ private:
         SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
     }
 
+    // [TAG_KV_FORK] text tokens two prompts have in common at their start (stops at the first media chunk)
+    static int32_t kv_fork_lcp(const server_tokens & a, const server_tokens & b) {
+        const size_t n = std::min(a.size(), b.size());
+        size_t i = 0;
+        while (i < n && a[i] == b[i] && a[i] != LLAMA_TOKEN_NULL) {
+            i++;
+        }
+        return (int32_t) i;
+    }
+
+    // smallest common prefix worth sharing, -1 when disabled (LLAMA_KV_FORK=0)
+    static int32_t kv_fork_min() {
+        static const int32_t res = [] {
+            const char * e = getenv("LLAMA_KV_FORK");
+            if (e && atoi(e) == 0) {
+                return -1;
+            }
+            const char * m = getenv("LLAMA_KV_FORK_MIN");
+            return m ? std::max(1, atoi(m)) : 512;
+        }();
+        return res;
+    }
+
+    server_slot * slot_by_id(int id) {
+        for (auto & s : slots) {
+            if (s.id == id) {
+                return &s;
+            }
+        }
+        return nullptr;
+    }
+
+    // tokens of this slot whose cells are shared with a live donor (counted once by the KV scheduler)
+    int32_t kv_shared_with_donor(const server_slot & s) {
+        if (s.kv_donor < 0 || s.kv_shared <= 0) {
+            return 0;
+        }
+        const server_slot * d = slot_by_id(s.kv_donor);
+        if (!d || d->prompt.n_tokens() < s.kv_shared || s.prompt.n_tokens() < s.kv_shared) {
+            return 0;
+        }
+        return s.kv_shared;
+    }
+
+    // a slot that may take part in prompt sharing
+    bool kv_fork_plain(const server_slot & s) const {
+        return s.task && s.task->type == SERVER_TASK_TYPE_COMPLETION && !s.task->is_parent() && !s.task->is_child() &&
+               s.task->n_tokens_shared == 0 && s.alora_invocation_start <= 0 && !s.audio_stream && s.can_split();
+    }
+
+    // called when a started slot is about to process its prompt
+    // returns true when the slot must wait for a donor slot to reach the fork point
+    bool kv_fork_start(server_slot & slot) {
+        if (slot.kv_fork_tried) {
+            return false;
+        }
+        slot.kv_fork_tried = true;
+
+        const int32_t n_min = kv_fork_min();
+        if (n_min < 0 || !params_base.kv_unified || slots.size() < 2 || !kv_fork_plain(slot) ||
+            !slot.task->params.cache_prompt || slot.task->is_stateless() || ctx_dft != nullptr) {
+            return false;
+        }
+
+        const auto & input = slot.task->tokens;
+        const int32_t n_input = (int32_t) input.size();
+        if (n_input < n_min + 1) {
+            return false;
+        }
+
+        // what the slot already has on its own
+        const int32_t n_own = kv_fork_lcp(slot.prompt.tokens, input);
+
+        // a) a donor with a checkpoint inside the common prefix: fork now
+        server_slot * best_now = nullptr;
+        std::shared_ptr<const common_prompt_checkpoint> best_ckpt;
+        int32_t n_now = 0;
+
+        // b) a donor that is processing the common prefix right now: wait for it to get there
+        server_slot * best_wait = nullptr;
+        int32_t n_wait = 0;
+
+        for (auto & d : slots) {
+            if (d.id == slot.id || !are_lora_equal(slot.lora, d.prompt.lora)) {
+                continue;
+            }
+
+            const int32_t lcp = std::min(kv_fork_lcp(d.prompt.tokens, input), n_input - 1);
+            for (auto it = d.prompt.checkpoints.rbegin(); it != d.prompt.checkpoints.rend(); ++it) {
+                const auto & ck = **it;
+                if (ck.n_tokens <= lcp && ck.n_tokens > n_now && ck.pos_max == (llama_pos) ck.n_tokens - 1 &&
+                    ck.id_task != -1 && ck.data_dft.empty()) {
+                    best_now  = &d;
+                    best_ckpt = *it;
+                    n_now     = (int32_t) ck.n_tokens;
+                    break;
+                }
+            }
+
+            if (d.state == SLOT_STATE_PROCESSING_PROMPT && kv_fork_plain(d) && !d.kv_wait) {
+                const int32_t p = std::min({ kv_fork_lcp(d.task->tokens, input), n_input - 1, d.task->n_tokens() - 1 });
+                if (p > n_wait && d.prompt.n_tokens() <= p) {
+                    best_wait = &d;
+                    n_wait    = p;
+                }
+            }
+        }
+
+        if (best_wait && n_wait >= std::max(n_own, n_now) + n_min) {
+            slot.kv_fork_donor = best_wait->id;
+            slot.kv_fork_task  = best_wait->task->id;
+            slot.kv_fork_n     = n_wait;
+            SLT_INF(slot, "shared prompt: waiting for slot %d to process the common %d tokens (it has %d)\n",
+                    best_wait->id, n_wait, best_wait->prompt.n_tokens());
+            return true;
+        }
+
+        if (best_now && n_now >= n_own + n_min) {
+            const int64_t t0 = ggml_time_us();
+            slot.mem.seq_rm(slot.id, -1, -1);
+            slot.mem.seq_cp(best_now->id, slot.id, 0, n_now);
+            bool ok = false;
+            try {
+                ok = best_ckpt->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            } catch (...) {
+                ok = false;
+            }
+            if (!ok) {
+                SLT_WRN(slot, "shared prompt: failed to load the checkpoint of slot %d, processing the prompt on its own\n", best_now->id);
+                slot.prompt_clear();
+                return false;
+            }
+            slot.prompt.tokens = best_now->prompt.tokens.clone();
+            slot.prompt.tokens.keep_first(n_now);
+            slot.prompt.checkpoints.clear();
+            for (const auto & ck : best_now->prompt.checkpoints) {
+                if (ck->n_tokens <= n_now) {
+                    slot.prompt.checkpoints.push_back(ck);
+                }
+            }
+            slot.prompt.lora = best_now->prompt.lora;
+            slot.kv_donor  = best_now->id;
+            slot.kv_shared = n_now;
+            SLT_INF(slot, "shared prompt: took %d tokens from slot %d (checkpoint, %.1f ms)\n",
+                    n_now, best_now->id, (ggml_time_us() - t0) / 1000.0);
+        }
+
+        return false;
+    }
+
+    // [TAG_KV_SCHED] admission control for the unified KV cache (-kvu)
+    // Stock behaviour: when parallel requests together outgrow the shared cache, decode fails and every running
+    // request gets "Context size has been exceeded". Here a started request only begins its prompt when the
+    // prompts + a generation reserve of everything already admitted still fit; the rest wait in arrival order.
+    // If the cache still runs low (a generation ran past its reserve), idle slots are purged first, then the
+    // youngest request that is still in its prompt is rolled back to waiting, and only as a last resort the
+    // youngest generating request is stopped with an error. Disable with LLAMA_KV_SCHED=0; the generation
+    // reserve per request is LLAMA_KV_GEN_RESERVE tokens (default 2048).
+    void kv_schedule() {
+        static const bool enabled = [] { const char * e = getenv("LLAMA_KV_SCHED"); return !e || atoi(e) != 0; }();
+        static const int64_t reserve = [] { const char * e = getenv("LLAMA_KV_GEN_RESERVE"); return e ? std::max(0, atoi(e)) : 2048; }();
+        if (!enabled || !params_base.kv_unified || slots.size() < 2) {
+            return;
+        }
+        const int64_t cap = llama_n_ctx(ctx_tgt);
+
+        auto gen_reserve = [&](const server_slot & s) -> int64_t {
+            const int64_t rem = s.n_remaining();
+            return rem < 0 ? reserve : std::min<int64_t>(rem, reserve);
+        };
+        auto is_admitted = [](const server_slot & s) {
+            return s.state == SLOT_STATE_PROCESSING_PROMPT || s.state == SLOT_STATE_DONE_PROMPT || s.state == SLOT_STATE_GENERATING;
+        };
+        auto plain = [](const server_slot & s) {
+            return s.task && !s.task->is_parent() && !s.task->is_child() &&
+                   s.task->type != SERVER_TASK_TYPE_TTS && s.task->type != SERVER_TASK_TYPE_REALTIME && !s.audio_stream;
+        };
+
+        // 1. admission, in arrival order
+        int64_t committed = 0;
+        int n_admitted = 0;
+        std::vector<server_slot *> waiting;
+        for (auto & s : slots) {
+            if (is_admitted(s)) {
+                committed += std::max<int64_t>(s.task->n_tokens(), s.prompt.n_tokens()) + gen_reserve(s) - kv_shared_with_donor(s);
+                n_admitted++;
+            } else if (s.state == SLOT_STATE_STARTED) {
+                waiting.push_back(&s);
+            }
+        }
+        std::sort(waiting.begin(), waiting.end(), [](const server_slot * a, const server_slot * b) { return a->task->id < b->task->id; });
+        bool blocked = false;
+        for (auto * s : waiting) {
+            int64_t need = s->task->n_tokens() + gen_reserve(*s);
+            // [TAG_KV_FORK] the part it can share with an admitted prompt is stored once
+            if (kv_fork_min() >= 0 && kv_fork_plain(*s)) {
+                int32_t n_share = 0;
+                for (auto & d : slots) {
+                    if (&d != s && is_admitted(d) && kv_fork_plain(d)) {
+                        n_share = std::max(n_share, kv_fork_lcp(d.task->tokens, s->task->tokens));
+                    }
+                }
+                if (n_share >= kv_fork_min()) {
+                    need -= n_share;
+                }
+            }
+            if (!plain(*s)) {
+                s->kv_wait = false;
+                continue;
+            }
+            if (!blocked && (n_admitted == 0 || committed + need <= cap)) {
+                if (s->kv_wait) {
+                    SLT_INF(*s, "KV cache has room now, starting prompt (%" PRId64 " tokens)\n", (int64_t) s->task->n_tokens());
+                }
+                s->kv_wait = false;
+                committed += need;
+                n_admitted++;
+            } else {
+                if (!s->kv_wait) {
+                    SLT_INF(*s, "waiting for KV cache space: needs %" PRId64 ", committed %" PRId64 " of %" PRId64 "\n", need, committed, cap);
+                }
+                s->kv_wait = true;
+                blocked = true; // keep arrival order
+            }
+        }
+
+        // 2. emergency: make sure this step's tokens fit
+        auto used = [&]() {
+            // [TAG_KV_FORK] the real cell count: shared cells count once
+            const int32_t n_used = llama_memory_n_cells_used(llama_get_memory(ctx_tgt));
+            if (n_used >= 0) {
+                return (int64_t) n_used;
+            }
+            int64_t u = 0;
+            for (auto & s : slots) {
+                u += s.prompt.n_tokens();
+            }
+            return u;
+        };
+        int64_t step = 0;
+        for (auto & s : slots) {
+            if (s.state == SLOT_STATE_GENERATING) {
+                step += 1 + (s.can_speculate() ? 16 : 0);
+            } else if (s.state == SLOT_STATE_PROCESSING_PROMPT || (s.state == SLOT_STATE_STARTED && !s.kv_wait)) {
+                step += std::min<int64_t>(llama_n_batch(ctx_tgt), std::max<int64_t>(0, s.task->n_tokens() - s.prompt.n_tokens()));
+            }
+        }
+        step = std::min<int64_t>(step, llama_n_batch(ctx_tgt) + (int64_t) slots.size() * 17);
+        while (used() + step > cap) {
+            server_slot * idle = nullptr;
+            for (auto & s : slots) {
+                if (!s.is_processing() && s.prompt.n_tokens() > 0) {
+                    idle = &s;
+                    break;
+                }
+            }
+            if (idle) {
+                SRV_WRN("KV cache nearly full, purging idle slot %d with %d tokens\n", idle->id, idle->prompt.n_tokens());
+                idle->prompt_clear();
+                continue;
+            }
+            server_slot * victim = nullptr;
+            for (auto & s : slots) {
+                if (s.state == SLOT_STATE_PROCESSING_PROMPT && plain(s) && (!victim || s.task->id > victim->task->id)) {
+                    victim = &s;
+                }
+            }
+            if (victim && n_admitted > 1) {
+                SLT_WRN(*victim, "KV cache nearly full, pausing this prompt (%d tokens done) until there is room\n", victim->prompt.n_tokens());
+                victim->prompt_clear();
+                victim->state   = SLOT_STATE_STARTED;
+                victim->kv_wait = true;
+                n_admitted--;
+                continue;
+            }
+            victim = nullptr;
+            int n_gen = 0;
+            for (auto & s : slots) {
+                if (s.state == SLOT_STATE_GENERATING && plain(s)) {
+                    n_gen++;
+                    if (!victim || s.task->id > victim->task->id) {
+                        victim = &s;
+                    }
+                }
+            }
+            if (victim && n_gen > 1) {
+                SLT_WRN(*victim, "KV cache full, stopping the newest generating request (%d tokens)\n", victim->prompt.n_tokens());
+                send_error(*victim, "The shared context is full: too many long requests at once. Retry this request.", ERROR_TYPE_UNAVAILABLE);
+                victim->release();
+                victim->prompt_clear();
+                continue;
+            }
+            break; // a single request that does not fit is handled by the normal context checks
+        }
+    }
+
+
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
@@ -2052,6 +2364,9 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        slot.kv_fork_donor = -1; // [TAG_KV_FORK]
+        slot.kv_fork_tried = false;
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -3559,6 +3874,8 @@ private:
             return;
         }
 
+        kv_schedule(); // [TAG_KV_SCHED]
+
         // note: TTS slots bypass the shared batch entirely
         try {
             process_tts_slots();
@@ -3957,9 +4274,24 @@ private:
                     return;
                 }
 
+                if (slot.state == SLOT_STATE_STARTED && slot.kv_wait) {
+                    return; // [TAG_KV_SCHED] waiting for room in the shared KV cache
+                }
+
                 // check if we can batch this slot with the previous one
                 if (slot_batched && !slot_batched->can_batch_with(slot)) {
                     return;
+                }
+
+                // [TAG_KV_FORK] waiting for a donor slot to reach the end of the shared prompt prefix
+                if (slot.state == SLOT_STATE_STARTED && slot.kv_fork_donor >= 0) {
+                    const server_slot * d = slot_by_id(slot.kv_fork_donor);
+                    if (d && d->state == SLOT_STATE_PROCESSING_PROMPT && d->task && d->task->id == slot.kv_fork_task &&
+                        d->prompt.n_tokens() <= slot.kv_fork_n) {
+                        return;
+                    }
+                    SLT_INF(slot, "%s", "shared prompt: the donor slot moved on, processing the prompt on its own\n");
+                    slot.kv_fork_donor = -1;
                 }
 
                 // check if this is a child slot
@@ -3982,6 +4314,10 @@ private:
                     const auto n_tokens_prev = batch.size();
 
                     // TODO: maybe move branch to outside of this loop in the future
+                    if (slot.state == SLOT_STATE_STARTED && kv_fork_start(slot)) {
+                        return; // [TAG_KV_FORK] wait for the donor
+                    }
+
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
 
@@ -4301,6 +4637,23 @@ private:
 
                     slot.mem.seq_rm(slot.id, p0, -1);
 
+                    // [TAG_KV_FORK] hand the state to the slots waiting at this point, stop at the next waiting point
+                    int32_t kv_fork_stop = -1;
+                    for (auto & other : slots) {
+                        if (other.kv_fork_donor != slot.id || other.kv_fork_task != slot.task->id || other.state != SLOT_STATE_STARTED) {
+                            continue;
+                        }
+                        if (other.kv_fork_n == slot.prompt.n_tokens()) {
+                            slot.copy_prompt_to(other);
+                            other.kv_fork_donor = -1;
+                            other.kv_donor      = slot.id;
+                            other.kv_shared     = slot.prompt.n_tokens();
+                            SLT_INF(other, "shared prompt: took %d tokens from slot %d\n", slot.prompt.n_tokens(), slot.id);
+                        } else if (other.kv_fork_n > slot.prompt.n_tokens()) {
+                            kv_fork_stop = kv_fork_stop < 0 ? other.kv_fork_n : std::min(kv_fork_stop, other.kv_fork_n);
+                        }
+                    }
+
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
                     if (slot.task->n_tokens_shared > 0) {
@@ -4415,6 +4768,11 @@ private:
 
                         // stop at the end of the shared prefix, the children are started from this state
                         if (wait_shared && slot.prompt.n_tokens() == slot.task->n_tokens_shared) {
+                            break;
+                        }
+
+                        // [TAG_KV_FORK] another slot takes the state at this point
+                        if (slot.prompt.n_tokens() == kv_fork_stop) {
                             break;
                         }
 

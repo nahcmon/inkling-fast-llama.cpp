@@ -821,6 +821,13 @@ public:
     ggml_tensor * swa_gather_idxs   = nullptr; // I32 [n_kv_gather_swa]
     ggml_tensor * swa_gather_mask   = nullptr; // F16 [n_kv_gather_swa, n_tokens]
 
+    // [TAG_BASE_GATHER] banded attention over a unified cache shared by several sequences: the sequence's
+    // cells are not at cell == pos, so they are gathered in position order (raw bytes, cache type kept)
+    static constexpr uint32_t gather_all = 1u << 30;
+    uint32_t      n_kv_gather_base  = 0;
+    ggml_tensor * base_gather_idxs  = nullptr; // I32 [n_kv_gather_base]
+    ggml_tensor * base_gather_mask  = nullptr; // F16 [n_kv_gather_base, n_tokens]
+
     const uint32_t extent;
     const uint32_t extent_swa;
 

@@ -7,6 +7,10 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -4979,6 +4983,25 @@ llama_pos llama_memory_seq_pos_min(
     }
 
     return mem->seq_pos_min(seq_id);
+}
+
+int32_t llama_memory_n_cells_used(llama_memory_t mem) {
+    if (!mem) {
+        return -1;
+    }
+    if (auto * m = dynamic_cast<const llama_kv_cache *>(mem)) {
+        return m->get_used();
+    }
+    if (auto * m = dynamic_cast<const llama_kv_cache_iswa *>(mem)) {
+        return m->get_base()->get_used();
+    }
+    if (auto * m = dynamic_cast<const llama_memory_hybrid *>(mem)) {
+        return m->get_mem_attn()->get_used();
+    }
+    if (auto * m = dynamic_cast<const llama_memory_hybrid_iswa *>(mem)) {
+        return m->get_mem_attn()->get_base()->get_used();
+    }
+    return -1;
 }
 
 llama_pos llama_memory_seq_pos_max(

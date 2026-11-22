@@ -88,6 +88,11 @@ private:
 
     const std::unique_ptr<llama_kv_cache_iswa> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+
+    // [TAG_SPLIT_PREFILL_BY_SEQ] unified cache: batch one token of every sequence together, then give every
+    // sequence's remaining (prefill) tokens their own ubatches, so attention never sees a multi-sequence prefill
+    const bool     split_prefill_by_seq;
+    const uint32_t n_seq_max;
 };
 
 class llama_memory_hybrid_iswa_context : public llama_memory_context_i {

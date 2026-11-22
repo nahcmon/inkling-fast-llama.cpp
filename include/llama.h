@@ -831,6 +831,10 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Returns the number of cells in use in the main (non-SWA) attention cache, -1 if unknown
+    // cells shared by several sequences (llama_memory_seq_cp) count once [TAG_KV_FORK]
+    LLAMA_API int32_t llama_memory_n_cells_used(llama_memory_t mem);
+
     // Returns the largest position present in the memory for the specified sequence
     // Note that all positions in the range [pos_min, pos_max] are guaranteed to be present in the memory
     // Return -1 if the sequence is empty

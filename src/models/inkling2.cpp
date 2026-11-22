@@ -5,7 +5,7 @@
 #include <vector>
 
 // max elements of the dense relative bias per attention call, and max chunks per layer
-static constexpr int64_t n_kq_bias_max  = int64_t(1) << 29;
+static constexpr int64_t n_kq_bias_max  = int64_t(1) << 26; // 256 MiB F32: this scratch is not in the startup reserve
 static constexpr int64_t n_kq_chunk_max = 64;
 // ubatches up to this many tokens keep the dense path
 static constexpr int64_t n_tokens_banded_min = 32;
@@ -70,6 +70,7 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     }
 
     ml.get_key(std::string("inkling2.fast_fold"), hparams.inkling_fold, false);
+    ml.get_key(std::string("inkling2.expert_down_pad"), hparams.inkling_down_pad, false);
 
     hparams.swa_type                = LLAMA_SWA_TYPE_STANDARD;
     hparams.expert_router_f32       = true;
@@ -179,7 +180,7 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate_inp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,     "weight", i), {n_embd, n_expert}, 0);
         layer.ffn_exp_probs_b  = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
-        layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+        layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {hparams.inkling_down_pad ? (int64_t) hparams.inkling_down_pad : (int64_t) n_ff_exp, n_embd, n_expert}, 0);
         // per-expert scales of NVFP4 experts; the merged gate_up scale rides in the up slot of build_moe_ffn
         layer.ffn_up_exps_s    = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale",  i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_down_exps_s  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "scale",  i), {n_expert}, TENSOR_NOT_REQUIRED);
@@ -489,7 +490,38 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             ggml_set_name(inp->swa_gather_mask, "attn_inp_swa_gather_mask");
         }
     }
+    // [TAG_BASE_GATHER] several sequences in a unified cache: gather this sequence's cells in position order
+    if (inp->banded && inp->n_kv_banded[0] == 0) {
+        inp->n_kv_gather_base = attn->mctx->get_base()->get_n_kv_pos_gather(inp->gather_all);
+        if (inp->n_kv_gather_base > 0) {
+            inp->base_gather_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->n_kv_gather_base);
+            ggml_set_input(inp->base_gather_idxs);
+            ggml_set_name(inp->base_gather_idxs, "attn_inp_base_gather_idxs");
+            inp->base_gather_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, inp->n_kv_gather_base, n_tokens);
+            ggml_set_input(inp->base_gather_mask);
+            ggml_set_name(inp->base_gather_mask, "attn_inp_base_gather_mask");
+        }
+    }
     const auto swa_gather = [&](bool swa) { return swa && inp->n_kv_banded[1] == 0 && inp->n_kv_gather_swa > 0; };
+    const auto base_gather = [&](bool swa) { return !swa && inp->n_kv_banded[0] == 0 && inp->n_kv_gather_base > 0; };
+    // gather whole cells as raw 32-bit words so quantized caches keep their type (and size)
+    const auto raw_gather = [&](ggml_tensor * all, ggml_tensor * idxs, int64_t n) -> ggml_tensor * {
+        const size_t cell = ggml_row_size(all->type, all->ne[0]*all->ne[1]);
+        if (all->nb[2] != cell || cell % 4 != 0 || all->nb[1] != ggml_row_size(all->type, all->ne[0])) {
+            return nullptr;
+        }
+        // real VIEW ops (src + op set) so the nodes stay in the graph; only the element type is reinterpreted
+        ggml_tensor * words = ggml_view_2d(ctx0, all, all->ne[0]*all->ne[1], all->ne[2], all->nb[2], 0);
+        words->type  = GGML_TYPE_I32;
+        words->ne[0] = cell/4; words->ne[1] = all->ne[2]; words->ne[2] = 1; words->ne[3] = 1;
+        words->nb[0] = 4; words->nb[1] = cell; words->nb[2] = cell*all->ne[2]; words->nb[3] = words->nb[2];
+        ggml_tensor * g = ggml_get_rows(ctx0, words, idxs);
+        ggml_tensor * t = ggml_view_2d(ctx0, g, g->ne[0], g->ne[1], g->nb[1], 0);
+        t->type  = all->type;
+        t->ne[0] = all->ne[0]; t->ne[1] = all->ne[1]; t->ne[2] = n; t->ne[3] = 1;
+        t->nb[0] = ggml_type_size(all->type); t->nb[1] = all->nb[1]; t->nb[2] = cell; t->nb[3] = cell*n;
+        return t;
+    };
     std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok;
     const auto use_banded = [&](int il, bool swa) {
         const auto * cache = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
@@ -500,7 +532,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                    t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 || t == GGML_TYPE_Q8_0;
         };
         const bool gather = swa_gather(swa);
-        if (!((inp->n_kv_banded[swa] > 0 || gather) && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
+        if (!((inp->n_kv_banded[swa] > 0 || gather || base_gather(swa)) && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
                 type_ok(cache->type_k()) && type_ok(cache->type_v()) && !cache->get_k_scale(il) && !cache->get_v_scale(il) &&
                 (swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3] == 1)) {
             return false;
@@ -712,7 +744,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 ggml_build_forward_expand(gf, cache->cpy_v(ctx0, Vcur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
 
                 const bool    gather = swa_gather(is_swa);
-                const int64_t n_kv_b = gather ? inp->n_kv_gather_swa : inp->n_kv_banded[is_swa];
+                const bool    bgath  = base_gather(is_swa);
+                const int64_t n_kv_b = gather ? inp->n_kv_gather_swa : bgath ? inp->n_kv_gather_base : inp->n_kv_banded[is_swa];
                 ggml_tensor * k_all = cache->get_k(ctx0, il);
                 ggml_tensor * v_all = cache->get_v(ctx0, il);
                 GGML_ASSERT(n_kv_b <= k_all->ne[2]);
@@ -730,6 +763,14 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     k_fa = gathered(k_all);
                     v_fa = gathered(v_all);
                     m    = inp->swa_gather_mask;
+                } else if (bgath) {
+                    GGML_ASSERT(v_all->nb[1] < v_all->nb[2]);
+                    ggml_tensor * kg = raw_gather(k_all, inp->base_gather_idxs, n_kv_b);
+                    ggml_tensor * vg = raw_gather(v_all, inp->base_gather_idxs, n_kv_b);
+                    GGML_ASSERT(kg && vg);
+                    k_fa = ggml_permute(ctx0, kg, 0, 2, 1, 3);
+                    v_fa = ggml_permute(ctx0, vg, 0, 2, 1, 3);
+                    m    = inp->base_gather_mask;
                 } else {
                 k_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_kv_b, k_all->ne[3],
                         k_all->nb[1], k_all->nb[2], k_all->nb[3], 0), 0, 2, 1, 3);

@@ -1250,6 +1250,14 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+uint32_t llama_kv_cache::get_used() const {
+    uint32_t res = 0;
+    for (const auto & cells : v_cells) {
+        res += cells.get_used();
+    }
+    return res;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 
@@ -3245,11 +3253,18 @@ void llama_kv_cache_context::set_input_pos_gather(ggml_tensor * idxs, ggml_tenso
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
     for (int64_t i = 0; i < mask->ne[1]; ++i) {
-        const int64_t pq = p0 + i;
-        for (int64_t j = 0; j < n; ++j) {
-            const int64_t pk = p_start + j;
-            m[i*mask->ne[0] + j] = (i < (int64_t) ubatch->n_tokens && pk <= pq && pq - pk < (int64_t) n_window) ? zero : ninf;
+        ggml_fp16_t * row = m + i*mask->ne[0];
+        if (i >= (int64_t) ubatch->n_tokens) {
+            std::fill(row, row + n, ninf);
+            continue;
         }
+        // visible keys: pq - n_window < pk <= pq  ->  j in [j0, j1)
+        const int64_t pq = p0 + i;
+        const int64_t j0 = std::clamp<int64_t>(pq - (int64_t) n_window + 1 - p_start, 0, n);
+        const int64_t j1 = std::clamp<int64_t>(pq + 1 - p_start, 0, n);
+        std::fill(row,      row + j0, ninf);
+        std::fill(row + j0, row + std::max(j0, j1), zero);
+        std::fill(row + std::max(j0, j1), row + n, ninf);
     }
 }
 

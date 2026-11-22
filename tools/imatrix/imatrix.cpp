@@ -562,6 +562,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
     const struct ggml_tensor * src0 = t->src[0];
     const struct ggml_tensor * src1 = t->src[1];
+    if (src0 == nullptr || src1 == nullptr) { return false; } // source-less nodes (e.g. arange in the inkling2 graph) [inkling-fast]
     std::string wname = filter_tensor_name(src0->name);
 
     const int32_t chunk_size = m_params.n_ctx / m_params.n_parallel;
@@ -569,8 +570,8 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
     // when ask is true, the scheduler wants to know if we are interested in data from this tensor
     // if we return true, a follow-up call will be made with ask=false in which we can do the actual collection
     if (ask) {
-        if (t->op == GGML_OP_MUL_MAT_ID) { return true; } // collect all indirect matrix multiplications
-        if (t->op != GGML_OP_MUL_MAT) { return false; }
+        if (t->op == GGML_OP_MUL_MAT_ID) { return src1->type == GGML_TYPE_F32; } // collect all indirect matrix multiplications (F32 activations only) [inkling-fast]
+        if (t->op != GGML_OP_MUL_MAT || getenv("IMAT_ONLY_ID")) { return false; } // IMAT_ONLY_ID: experts only [inkling-fast]
         // why are small batches ignored (<16 tokens)?
         if (src1->ne[1] < 16 || src1->type != GGML_TYPE_F32) { return false; }
         const bool is_output = wname == "output.weight" || wname == "token_embd.weight" || wname == "nextn.post_projection.weight";

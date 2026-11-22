@@ -160,6 +160,7 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
+    uint32_t get_used()     const; // cells in use, over all streams [TAG_KV_FORK]
 
     bool get_has_shift() const;
 

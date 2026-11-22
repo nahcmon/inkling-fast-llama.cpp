@@ -62,7 +62,9 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
-    )) {}
+    )),
+    split_prefill_by_seq(model.arch == LLM_ARCH_INKLING2),
+    n_seq_max(n_seq_max) {}
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -71,7 +73,37 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
         // follow the recurrent pattern for creating the ubatch splits
         std::vector<llama_ubatch> ubatches;
 
-        while (true) {
+        // [TAG_SPLIT_PREFILL_BY_SEQ] Inkling's banded attention needs one sequence per prefill ubatch; a
+        // multi-sequence prefill falls back to the dense relative bias (n_kv x n_tokens x n_head, up to 2 GiB
+        // of scratch). Decode tokens of all sequences still share one ubatch, so parallel decode stays batched.
+        const bool unified_attn = mem_attn->get_base()->get_n_stream() == 1;
+        if (split_prefill_by_seq && !embd_all && unified_attn && mem_recr->n_rs_seq == 0) {
+            uint32_t n_seqs = 0;
+            bool multi_tok = false;
+            for (uint32_t s = 0; s < n_seq_max; ++s) {
+                const llama_pos p0 = balloc.seq_pos_min(s);
+                if (p0 >= 0) {
+                    ++n_seqs;
+                    multi_tok |= balloc.seq_pos_max(s) > p0;
+                }
+            }
+            if (n_seqs > 1 && multi_tok) {
+                llama_ubatch first = balloc.split_equal(n_seqs, false, 0);
+                if (first.n_tokens > 0) {
+                    ubatches.push_back(std::move(first)); // NOLINT
+                }
+                while (true) {
+                    llama_ubatch ubatch = balloc.split_seq(n_ubatch);
+                    if (ubatch.n_tokens == 0) {
+                        break;
+                    }
+                    ubatches.push_back(std::move(ubatch)); // NOLINT
+                }
+            }
+        }
+
+        const bool split_done = !ubatches.empty();
+        while (!split_done) {
             llama_ubatch ubatch;
 
             if (embd_all) {
