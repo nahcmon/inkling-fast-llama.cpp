@@ -102,7 +102,7 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
+void llama_model_inkling2::load_arch_tensors(llama_model_loader & loader) {
     LLAMA_LOAD_LOCALS;
 
     if (hparams.n_vocab_unpadded != vocab.n_tokens()) {
@@ -181,7 +181,16 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate_inp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,     "weight", i), {n_embd, n_expert}, 0);
         layer.ffn_exp_probs_b  = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
-        layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {hparams.inkling_down_pad ? (int64_t) hparams.inkling_down_pad : (int64_t) n_ff_exp, n_embd, n_expert}, 0);
+        // [TAG_INKLING_DOWN_PAD_PER_LAYER] expert down rows: n_ff_exp, or zero-padded to a 256-multiple for K/IQ quants;
+        // decided per layer by the stored tensor, so padded IQ layers can sit next to unpadded Q2_0/NVFP4/IQ4_NL ones
+        // (build_moe_ffn pads the activations to whatever the layer's down tensor holds)
+        int64_t n_down = hparams.inkling_down_pad ? (int64_t) hparams.inkling_down_pad : n_ff_exp;
+        if (const ggml_tensor * meta = loader.get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i).str().c_str())) {
+            if (meta->ne[0] >= n_ff_exp && meta->ne[0] % 32 == 0) {
+                n_down = meta->ne[0];
+            }
+        }
+        layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_down, n_embd, n_expert}, 0);
         // per-expert scales of NVFP4 experts; the merged gate_up scale rides in the up slot of build_moe_ffn
         layer.ffn_up_exps_s    = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale",  i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_down_exps_s  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "scale",  i), {n_expert}, TENSOR_NOT_REQUIRED);

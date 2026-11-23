@@ -2120,15 +2120,91 @@ size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+// [TAG_Q2_0_IMATRIX] weighted scale search for Q2_0 (same format as the reference quantizer). The levels are
+// {-1, 0, +1, +2}*d; the reference sets d = amax, which leaves +2 unused and rounds everything below amax/2 to zero.
+// Here d is searched over both signs (a negative d puts the +2 level on the negative side) and refined by weighted
+// least squares, with the importance weights of the imatrix (or x^2 without one).
+static void quantize_row_q2_0_impl(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
+    static const int qk = QK2_0;
+    const int nb = n_per_row / qk;
+
+    float sigma2 = 0;
+    for (int j = 0; j < n_per_row; ++j) sigma2 += x[j]*x[j];
+    sigma2 = 2*sigma2/n_per_row;
+
+    float w[QK2_0];
+    int8_t q[QK2_0], best_q[QK2_0];
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib*qk;
+        const float * qw = quant_weights ? quant_weights + ib*qk : NULL;
+        float amax = 0;
+        for (int j = 0; j < qk; ++j) {
+            w[j] = qw ? qw[j]*sqrtf(sigma2 + xb[j]*xb[j]) : xb[j]*xb[j];
+            amax = MAX(amax, fabsf(xb[j]));
+        }
+        memset(y[ib].qs, 0, sizeof(y[ib].qs));
+        if (amax < GROUP_MAX_EPS) {
+            y[ib].d = GGML_FP32_TO_FP16(0.f);
+            for (int j = 0; j < qk; ++j) y[ib].qs[j/4] |= 1 << ((j%4)*2);
+            continue;
+        }
+        float best_err = INFINITY, best_d = 0;
+        for (int sgn = -1; sgn <= 1; sgn += 2) {
+            for (int is = 0; is <= 48; ++is) {
+                // trial step from amax/2.2 (all four levels in play) to amax/1.0 (three levels)
+                const float d0 = sgn*amax/(2.2f - 1.2f*is/48.f);
+                const float id = 1/d0;
+                float sumxq = 0, sumqq = 0;
+                for (int j = 0; j < qk; ++j) {
+                    int l = (int)nearbyintf(xb[j]*id);
+                    l = MAX(-1, MIN(2, l));
+                    q[j] = l;
+                    sumxq += w[j]*xb[j]*l; sumqq += w[j]*l*l;
+                }
+                if (sumqq <= 0) continue;
+                const float d = sumxq/sumqq;   // weighted least squares step for these levels
+                float err = 0;
+                for (int j = 0; j < qk; ++j) { const float e = xb[j] - d*q[j]; err += w[j]*e*e; }
+                if (err < best_err) { best_err = err; best_d = d; memcpy(best_q, q, qk); }
+            }
+        }
+        // one more rounding pass at the refined step (kept only if it helps)
+        if (best_d != 0) {
+            const float id = 1/best_d;
+            float sumxq = 0, sumqq = 0;
+            for (int j = 0; j < qk; ++j) {
+                int l = (int)nearbyintf(xb[j]*id); l = MAX(-1, MIN(2, l)); q[j] = l;
+                sumxq += w[j]*xb[j]*l; sumqq += w[j]*l*l;
+            }
+            if (sumqq > 0) {
+                const float d = sumxq/sumqq; float err = 0;
+                for (int j = 0; j < qk; ++j) { const float e = xb[j] - d*q[j]; err += w[j]*e*e; }
+                if (err < best_err) { best_err = err; best_d = d; memcpy(best_q, q, qk); }
+            }
+        }
+        y[ib].d = GGML_FP32_TO_FP16(best_d);
+        // round against the fp16 step actually stored
+        const float ds = GGML_FP16_TO_FP32(y[ib].d);
+        const float ids = ds != 0 ? 1/ds : 0;
+        for (int j = 0; j < qk; ++j) {
+            const int l = ds != 0 ? MAX(-1, MIN(2, (int)nearbyintf(xb[j]*ids))) : 0;
+            y[ib].qs[j/4] |= (uint8_t)(l + 1) << ((j%4)*2);
+        }
+    }
+}
+
 size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    if (!quant_weights) {
+    // GGML_Q2_0_REF=1: the reference round-to-nearest quantizer (A/B)
+    const int use_ref = getenv("GGML_Q2_0_REF") != NULL;
+    if (use_ref) {
         quantize_row_q2_0_ref(src, dst, (int64_t)nrow*n_per_row);
         return nrow * ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
     }
     size_t row_size = ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrow; ++row) {
-        quantize_row_q2_0_ref(src, (block_q2_0*)qrow, n_per_row);
+        quantize_row_q2_0_impl(src, (block_q2_0*)qrow, n_per_row, quant_weights);
         src += n_per_row;
         qrow += row_size;
     }
