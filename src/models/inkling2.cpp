@@ -2,10 +2,11 @@
 #include "../llama-memory-hybrid-iswa.h"
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 // max elements of the dense relative bias per attention call, and max chunks per layer
-static constexpr int64_t n_kq_bias_max  = int64_t(1) << 26; // 256 MiB F32: this scratch is not in the startup reserve
+static constexpr int64_t n_kq_bias_max  = int64_t(1) << 26; // 256 MiB F32
 static constexpr int64_t n_kq_chunk_max = 64;
 // ubatches up to this many tokens keep the dense path
 static constexpr int64_t n_tokens_banded_min = 32;
@@ -429,11 +430,23 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const bool fold = hparams.inkling_fold != 0;
 
     // folded weights: the taps carry the residual and the output scale, the dynamic taps are lag-reversed and prescaled
-    if (fold && dynamic && n_seq_tokens == 1 && n_seqs == 1) {
+    if (fold && dynamic && n_seq_tokens == 1) {
         const int64_t n_heads = dynamic->ne[0]/n_conv;
-        ggml_tensor * coef = ggml_add(ctx0, ggml_reshape_3d(ctx0, weight, n_conv, n_channels/n_heads, n_heads),
-                                            ggml_reshape_3d(ctx0, dynamic, n_conv, 1, n_heads));
-        ggml_tensor * out = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_reshape_3d(ctx0, x, n_conv, n_channels/n_heads, n_heads), coef));
+        ggml_tensor * coef = nullptr;
+        ggml_tensor * xs   = nullptr;
+        if (n_seqs == 1) {
+            coef = ggml_add(ctx0, ggml_reshape_3d(ctx0, weight, n_conv, n_channels/n_heads, n_heads),
+                                  ggml_reshape_3d(ctx0, dynamic, n_conv, 1, n_heads));
+            xs   = ggml_reshape_3d(ctx0, x, n_conv, n_channels/n_heads, n_heads);
+        } else {
+            // [TAG_CONV_DYN_FOLD_SEQS] several sequences (parallel decoding): the weights repeated per sequence, so that
+            // the sum is the same x*(w + tap) as for one sequence (backends that fuse the chain never form the repeat)
+            ggml_tensor * w4 = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, weight, n_conv, n_channels/n_heads, n_heads),
+                                              n_conv, n_channels/n_heads, n_heads, n_seqs);
+            coef = ggml_add(ctx0, w4, ggml_reshape_4d(ctx0, dynamic, n_conv, 1, n_heads, n_seqs));
+            xs   = ggml_reshape_4d(ctx0, x, n_conv, n_channels/n_heads, n_heads, n_seqs);
+        }
+        ggml_tensor * out = ggml_sum_rows(ctx0, ggml_mul(ctx0, xs, coef));
         out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
         // right after the state store, so that the convolution is one run of nodes that backends can fuse
         ggml_build_forward_expand(gf, out);
@@ -629,6 +642,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 }
             }
         }
+
+        // DSpark taps the input of every layer visit (after the pass restart), cf. ggml-org 0a9105de4
+        res->t_layer_inp[il] = cur;
 
         const bool    is_swa       = hparams.is_swa(il);
         const int64_t n_head       = hparams.n_head(il);
@@ -828,12 +844,32 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 const int64_t n_seq_tokens = n_tokens/n_stream;
                 // sized for a full cache so the chunking does not change while it fills
                 const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
-                int64_t n_rows_max = std::max({ int64_t(1), n_kq_bias_max/(n_kv_max*n_head*n_stream),
-                        (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
+                // [TAG_KQ_BIAS_BUDGET] a chunk is never taller than the decode reserve (n_seq_max tokens over a full
+                // cache): a taller one (e.g. a few decodes plus a short prompt tail) would grow the compute buffer
+                // past its startup size at runtime and, on a full GPU, spill into shared memory and halve the speed
+                const int64_t n_rows_res = std::max<int64_t>(1, std::min<int64_t>(cparams.n_seq_max, cparams.n_ubatch)/n_stream);
+                const int64_t n_rows_cap = std::max<int64_t>(1, std::min(n_rows_res, n_kq_bias_max/(n_kv_max*n_head*n_stream)));
+                int64_t n_rows_max = std::max(n_rows_cap, (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max);
                 if (n_rows_max < n_seq_tokens) {
                     const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
-                    n_rows_max = std::min(n_seq_tokens, GGML_PAD((n_seq_tokens + n_chunks - 1)/n_chunks, 64));
+                    const int64_t n_rows   = (n_seq_tokens + n_chunks - 1)/n_chunks;
+                    n_rows_max = GGML_PAD(n_rows, 64) <= n_rows_max ? std::min(n_seq_tokens, GGML_PAD(n_rows, 64)) : n_rows;
                 }
+                // CUDA converts while gathering: flash attention takes the bias in F16 anyway, so the scratch halves
+                // (the bias rounds to F16 before the 0/-inf mask is added instead of after: the same values)
+                const bool bias_f16 = cparams.flash_attn && model.dev_layer(il) &&
+                        strncmp(ggml_backend_dev_name(model.dev_layer(il)), "CUDA", 4) == 0;
+                const auto gather_bias = [&](ggml_tensor * a, ggml_tensor * b) {
+                    ggml_tensor * g = ggml_get_rows(ctx0, a, b);
+                    if (bias_f16) {
+                        ggml_tensor * h = ggml_new_tensor(ctx0, GGML_TYPE_F16, GGML_MAX_DIMS, g->ne);
+                        h->op     = GGML_OP_GET_ROWS;
+                        h->src[0] = a;
+                        h->src[1] = b;
+                        g = h;
+                    }
+                    return g;
+                };
                 auto rows = [&](ggml_tensor * t, int d, int64_t r0, int64_t nr) {
                     int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
                     ne[d] = nr;
@@ -846,7 +882,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     ggml_tensor * q_c = Qcur;
                     ggml_tensor * kq_b = nullptr;
                     if (all) {
-                        kq_b = ggml_get_rows(ctx0, table, rel_pos);
+                        kq_b = gather_bias(table, rel_pos);
                         kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, nr, n_stream);
                         kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
                     } else {
@@ -861,7 +897,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                         }
                         ggml_tensor * rel_pos_c = ggml_view_3d(ctx0, rel_pos_dev, n_kv, nr, n_stream,
                                 rel_pos_dev->nb[1], n_seq_tokens*rel_pos_dev->nb[1], r0*rel_pos_dev->nb[1]);
-                        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, ggml_get_rows(ctx0, table_c, rel_pos_c), 2, 0, 1, 3));
+                        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, gather_bias(table_c, rel_pos_c), 2, 0, 1, 3));
                     }
                     cb(kq_b, "kq_b", il);
 
@@ -940,6 +976,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    res->t_layer_inp[n_layer] = cur;
 
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);

@@ -750,7 +750,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
-                    if (Q->ne[1] == 1) {
+                    // [TAG_FA_VEC_QKV] the MMA kernel needs an f16 copy of the whole quantized K/V: at 128k context that
+                    // is 512 MiB for one layer, enough to push a 12 GB card into shared memory. The vector kernel reads
+                    // q4_0/q8_0 directly, so parallel decode (one token per chat, up to 8 chats) stays on it.
+                    if (Q->ne[1] <= 8) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 }

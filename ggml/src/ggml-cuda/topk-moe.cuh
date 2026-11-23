@@ -14,6 +14,7 @@ struct ggml_cuda_topk_moe_args {
     bool prob_bias{};
     bool norm{};
     bool scale{};
+    ggml_op norm_op = GGML_OP_CLAMP; // [TAG_TOPK_NORM_EPS] CLAMP (min) or SCALE (scale_bias 1, +eps) on the weight sum
     int  n_groups{};     // > 0: pick experts only from the top n_group_used expert groups
     int  n_group_used{};
 };

@@ -10783,6 +10783,89 @@ static const ggml_type other_types[] = {
     GGML_TYPE_BF16,
 };
 
+
+// [TAG_CONV_DYN_FOLD_SEQS] the folded short convolution with dynamic taps of Inkling-2 at decode (one token per
+// sequence), as built by llama_model_inkling2::graph::convolve: history window + new column, the state store of
+// the last d_conv-1 columns, and sum_rows(x * (w + taps)); backends may fuse the whole run of nodes
+struct test_inkling2_conv_dyn_fold : public test_case {
+    const int64_t d_conv;
+    const int64_t n_c;
+    const int64_t n_heads;
+    const int64_t n_s;
+    ggml_tensor * out_node {};
+    ggml_tensor * cpy_node {};
+
+    test_inkling2_conv_dyn_fold(int64_t d_conv = 4, int64_t n_c = 1024, int64_t n_heads = 8, int64_t n_s = 1)
+        : d_conv(d_conv), n_c(n_c), n_heads(n_heads), n_s(n_s) {}
+
+    std::string vars() override { return VARS_TO_STR4(d_conv, n_c, n_heads, n_s); }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING2_CONV_DYN_FOLD";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return mode == MODE_TEST ? std::vector<ggml_tensor *>{ out_node, cpy_node } : std::vector<ggml_tensor *>{ out_node };
+    }
+
+    // the conv weights are model weights, as the fusion requires
+    bool use_weight_context() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        // the history holds more channels than this convolution (k, v, post convs side by side), offset by one block
+        const int64_t c_total  = 3*n_c;
+        const int64_t offset   = n_c;
+        const int64_t mem_size = n_s + 2;
+        const int64_t head     = 1;
+
+        ggml_tensor * state   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*c_total, mem_size);
+        ggml_tensor * history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, c_total, n_s);
+        ggml_tensor * cur     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_c, n_s);
+        ggml_tensor * weight  = ggml_new_tensor_2d(ctx_weights, GGML_TYPE_F32, d_conv, n_c);
+        ggml_tensor * dynamic = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv*n_heads, n_s);
+        ggml_set_name(state, "state");
+
+        ggml_tensor * past = ggml_view_3d(ctx, history, d_conv - 1, n_c, n_s, history->nb[1], history->nb[2], offset*history->nb[1]);
+        ggml_tensor * x    = ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n_c, 1, n_s));
+        x = ggml_concat(ctx, past, x, 0);
+
+        ggml_tensor * last = ggml_view_3d(ctx, x, d_conv - 1, n_c, n_s, x->nb[1], x->nb[2], ggml_row_size(x->type, 1));
+        ggml_tensor * cell = ggml_view_2d(ctx, state, (d_conv - 1)*n_c, n_s, state->nb[1],
+                                          head*state->nb[1] + offset*(d_conv - 1)*ggml_element_size(state));
+        cpy_node = ggml_cpy(ctx, last, cell);
+        ggml_set_name(cpy_node, "conv_state_cpy");
+        if (mode == MODE_TEST) {
+            // the state store right after the concat, as in the model graph
+            ggml_build_forward_expand(gf, cpy_node);
+        }
+
+        ggml_tensor * coef = nullptr;
+        ggml_tensor * xs   = nullptr;
+        if (n_s == 1) {
+            coef = ggml_add(ctx, ggml_reshape_3d(ctx, weight, d_conv, n_c/n_heads, n_heads),
+                                 ggml_reshape_3d(ctx, dynamic, d_conv, 1, n_heads));
+            xs   = ggml_reshape_3d(ctx, x, d_conv, n_c/n_heads, n_heads);
+        } else {
+            ggml_tensor * w4 = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, weight, d_conv, n_c/n_heads, n_heads),
+                                              d_conv, n_c/n_heads, n_heads, n_s);
+            coef = ggml_add(ctx, w4, ggml_reshape_4d(ctx, dynamic, d_conv, 1, n_heads, n_s));
+            xs   = ggml_reshape_4d(ctx, x, d_conv, n_c/n_heads, n_heads, n_s);
+        }
+        ggml_tensor * out = ggml_sum_rows(ctx, ggml_mul(ctx, xs, coef));
+        out = ggml_reshape_2d(ctx, out, n_c, n_s);
+        ggml_set_name(out, "out");
+        out_node = out;
+
+        return out;
+    }
+};
+
 #ifdef _MSC_VER
 // Workaround long compile time with msvc
 #pragma optimize("", off)
@@ -10791,6 +10874,13 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // [TAG_CONV_DYN_FOLD_SEQS] Inkling-2 folded dynamic short convolution, one and several sequences
+    for (int64_t n_s : { 1, 2, 3, 8 }) {
+        test_cases.emplace_back(new test_inkling2_conv_dyn_fold(4, 1024, 8, n_s));
+        test_cases.emplace_back(new test_inkling2_conv_dyn_fold(4, 2048, 16, n_s));
+    }
+    test_cases.emplace_back(new test_inkling2_conv_dyn_fold(3, 256, 2, 5));
+
     std::default_random_engine rng(0);
 
     // unary ops
@@ -13704,6 +13794,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
+                    if (with_norm) { // [TAG_TOPK_NORM_EPS] sum + eps instead of the clamp (Inkling, DeepSeek-V4.1)
+                        test_cases.emplace_back(new test_topk_moe({128, 8, 1, 1}, 8, true, bias_probs, gate, scale_w, 1, true));
+                        test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, true, bias_probs, gate, scale_w, 1, true));
+                    }
                     test_cases.emplace_back(new test_topk_moe({384,  1, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4.1
                     test_cases.emplace_back(new test_topk_moe({384,  8, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({384, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
@@ -13844,6 +13938,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // [TAG_INKLING_MMID_PERF] Inkling-2-Mini decode experts: 128 experts, 8 used, random routing
+    for (int n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS,  GGML_TYPE_F32, 128, 8, false, 2304, n, 2304));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 128, 8, false, 2304, n, 1280));
+    }
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));

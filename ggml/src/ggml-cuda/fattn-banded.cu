@@ -466,7 +466,9 @@ static __device__ __forceinline__ uint32_t fattn_banded_pack_h2(const float lo, 
     return *(const uint32_t *) &h;
 }
 
-template<int D, int NW>
+// [TAG_BANDED_QKV] q4_0/q8_0 rows are dequantized to f16 while the tile loads (8 values per thread, all inside one
+// 32-value block), so the kernel needs no f16 copy of the whole cache: at 128k context that copy alone was ~0.5 GB
+template<int D, int NW, ggml_type T>
 static __device__ __forceinline__ void fattn_banded_mma_load_tile(
         half * __restrict__ tile, const char * __restrict__ src, const uint64_t nb1, const int64_t kv0, const int64_t n_kv) {
     constexpr int stride   = D + 8;
@@ -478,7 +480,29 @@ static __device__ __forceinline__ void fattn_banded_mma_load_tile(
         const int row = c / chunks;
         const int col = (c % chunks)*8;
         half * dst = tile + row*stride + col;
-        if (kv0 + row < n_kv) {
+        if (T == GGML_TYPE_Q4_0 && kv0 + row < n_kv) {
+            const block_q4_0 * b = (const block_q4_0 *) (src + uint64_t(kv0 + row)*nb1) + col/QK4_0;
+            const float d  = __half2float(b->d);
+            const int   j  = col % QK4_0;
+            const int   sh = j >= QK4_0/2 ? 4 : 0;
+            const uint8_t * qs = b->qs + (j % (QK4_0/2));
+            half2 h[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                h[e] = __floats2half2_rn((int((qs[2*e + 0] >> sh) & 0xF) - 8)*d, (int((qs[2*e + 1] >> sh) & 0xF) - 8)*d);
+            }
+            *(int4 *) dst = *(const int4 *) h;
+        } else if (T == GGML_TYPE_Q8_0 && kv0 + row < n_kv) {
+            const block_q8_0 * b = (const block_q8_0 *) (src + uint64_t(kv0 + row)*nb1) + col/QK8_0;
+            const float d = __half2float(b->d);
+            const int8_t * qs = b->qs + col % QK8_0;
+            half2 h[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                h[e] = __floats2half2_rn(qs[2*e + 0]*d, qs[2*e + 1]*d);
+            }
+            *(int4 *) dst = *(const int4 *) h;
+        } else if (kv0 + row < n_kv) {
             const char * s = src + uint64_t(kv0 + row)*nb1 + uint64_t(col)*sizeof(half);
 #ifdef CP_ASYNC_AVAILABLE
             const uint32_t d = (uint32_t) __cvta_generic_to_shared(dst);
@@ -540,7 +564,7 @@ static __global__ void flash_attn_ext_banded_mma_tile_flags(
     }
 }
 
-template<int D, int NW>
+template<int D, int NW, ggml_type T>
 __launch_bounds__(NW*WARP_SIZE, 1)
 static __global__ void flash_attn_ext_banded_mma(
         const char * __restrict__ q,
@@ -659,8 +683,8 @@ static __global__ void flash_attn_ext_banded_mma(
 
     int64_t kt = next_tile(kt_begin);
     if (kt < kt_end) {
-        fattn_banded_mma_load_tile<D, NW>(K_s, k_base, k_nb1, kt*BK, n_kv);
-        fattn_banded_mma_load_tile<D, NW>(V_s, v_base, v_nb1, kt*BK, n_kv);
+        fattn_banded_mma_load_tile<D, NW, T>(K_s, k_base, k_nb1, kt*BK, n_kv);
+        fattn_banded_mma_load_tile<D, NW, T>(V_s, v_base, v_nb1, kt*BK, n_kv);
     }
 
     while (kt < kt_end) {
@@ -759,7 +783,7 @@ static __global__ void flash_attn_ext_banded_mma(
         __syncthreads();
         const int64_t kt_next = next_tile(kt + 1);
         if (kt_next < kt_end) {
-            fattn_banded_mma_load_tile<D, NW>(K_s, k_base, k_nb1, kt_next*BK, n_kv);
+            fattn_banded_mma_load_tile<D, NW, T>(K_s, k_base, k_nb1, kt_next*BK, n_kv);
             fattn_banded_mma_wait<1>(); // V tile of this iteration landed
         } else {
             fattn_banded_mma_wait<0>();
@@ -780,7 +804,7 @@ static __global__ void flash_attn_ext_banded_mma(
 
         __syncthreads();
         if (kt_next < kt_end) {
-            fattn_banded_mma_load_tile<D, NW>(V_s, v_base, v_nb1, kt_next*BK, n_kv);
+            fattn_banded_mma_load_tile<D, NW, T>(V_s, v_base, v_nb1, kt_next*BK, n_kv);
         }
         kt = kt_next;
     }
@@ -925,6 +949,11 @@ static bool fattn_banded_mma_usable(const int device, const ggml_tensor * dst) {
     return true;
 }
 
+static bool fattn_banded_mma_kv_inkernel(const ggml_tensor * k, const ggml_tensor * v) {
+    return k->type == v->type && (k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0) &&
+        k->ne[0] % 32 == 0 && v->ne[0] % 32 == 0;
+}
+
 static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale, const int64_t rel_extent) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
@@ -958,12 +987,15 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
         nb[2] = t->ne[1]*nb[1];
         nb[3] = t->ne[2]*nb[2];
     };
-    to_f16(k, f16_extra.K, k_data, k_nb);
-    if (f16_extra.V == f16_extra.K && v->type != GGML_TYPE_F16) {
-        v_data = k_data;
-        for (int i = 0; i < 4; ++i) { v_nb[i] = k_nb[i]; }
-    } else {
-        to_f16(v, f16_extra.V, v_data, v_nb);
+    const ggml_type kvt = fattn_banded_mma_kv_inkernel(k, v) ? k->type : GGML_TYPE_F16;
+    if (kvt == GGML_TYPE_F16) {
+        to_f16(k, f16_extra.K, k_data, k_nb);
+        if (f16_extra.V == f16_extra.K && v->type != GGML_TYPE_F16) {
+            v_data = k_data;
+            for (int i = 0; i < 4; ++i) { v_nb[i] = k_nb[i]; }
+        } else {
+            to_f16(v, f16_extra.V, v_data, v_nb);
+        }
     }
 
     const int nw = n_q >= 64 ? 4 : (n_q >= 32 ? 2 : 1);
@@ -980,13 +1012,20 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     }
 
     int occ = 0;
-#define OCC_BANDED_MMA(DD, NW) CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, flash_attn_ext_banded_mma<DD, NW>, NW*WARP_SIZE, 0))
+#define OCC_BANDED_MMA_K(DD, NW, T) CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, flash_attn_ext_banded_mma<DD, NW, T>, NW*WARP_SIZE, 0))
+#define OCC_BANDED_MMA(DD, NW) \
+    switch (kvt) { \
+        case GGML_TYPE_Q4_0: OCC_BANDED_MMA_K(DD, NW, GGML_TYPE_Q4_0); break; \
+        case GGML_TYPE_Q8_0: OCC_BANDED_MMA_K(DD, NW, GGML_TYPE_Q8_0); break; \
+        default:             OCC_BANDED_MMA_K(DD, NW, GGML_TYPE_F16);  break; \
+    }
     if (D == 64) {
         if (nw == 4) { OCC_BANDED_MMA(64, 4); } else if (nw == 2) { OCC_BANDED_MMA(64, 2); } else { OCC_BANDED_MMA(64, 1); }
     } else {
         if (nw == 4) { OCC_BANDED_MMA(128, 4); } else if (nw == 2) { OCC_BANDED_MMA(128, 2); } else { OCC_BANDED_MMA(128, 1); }
     }
 #undef OCC_BANDED_MMA
+#undef OCC_BANDED_MMA_K
     const int64_t resident    = int64_t(std::max(occ, 1))*ggml_cuda_info().devices[ctx.device].nsm;
     const int64_t base_blocks = n_qt*q->ne[2]*q->ne[3];
     constexpr int64_t min_tiles_per_chunk = 4;
@@ -1016,7 +1055,13 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
 
     const dim3 blocks(n_qt*n_chunks, q->ne[2], q->ne[3]);
 #define LAUNCH_BANDED_MMA(DD, NW) \
-    flash_attn_ext_banded_mma<DD, NW><<<blocks, NW*WARP_SIZE, 0, stream>>>( \
+    switch (kvt) { \
+        case GGML_TYPE_Q4_0: LAUNCH_BANDED_MMA_K(DD, NW, GGML_TYPE_Q4_0); break; \
+        case GGML_TYPE_Q8_0: LAUNCH_BANDED_MMA_K(DD, NW, GGML_TYPE_Q8_0); break; \
+        default:             LAUNCH_BANDED_MMA_K(DD, NW, GGML_TYPE_F16);  break; \
+    }
+#define LAUNCH_BANDED_MMA_K(DD, NW, T) \
+    flash_attn_ext_banded_mma<DD, NW, T><<<blocks, NW*WARP_SIZE, 0, stream>>>( \
         (const char *) q->data, k_data, v_data, m ? (const char *) m->data : nullptr, m ? flags.get() : nullptr, \
         (const char *) rel->data, n_chunks == 1 ? sinks_d : nullptr, (float *) dst->data, part.get(), \
         scale, rel->type, n_q, n_kv, q->ne[2], k->ne[2], n_chunks, tiles_per_chunk, rel_extent, \
@@ -1037,6 +1082,7 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     }
 #undef LAUNCH_BANDED_MMA_NW
 #undef LAUNCH_BANDED_MMA
+#undef LAUNCH_BANDED_MMA_K
     CUDA_CHECK(cudaGetLastError());
 
     if (n_chunks > 1) {
@@ -1057,7 +1103,8 @@ size_t ggml_cuda_flash_attn_ext_banded_get_alloc_size(int device, const ggml_ten
     if (ggml_cuda_flash_attn_ext_banded_use_mma(device, dst)) {
         return ggml_cuda_flash_attn_ext_get_alloc_size(device, dst); // delegated to the generic kernels
     }
-    const bool mma = dst->src[4] && fattn_banded_mma_usable(device, dst);
+    const bool mma = dst->src[4] && fattn_banded_mma_usable(device, dst) &&
+        !fattn_banded_mma_kv_inkernel(dst->src[1], dst->src[2]);
     const ggml_cuda_flash_attn_ext_f16_extra_data e = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, mma, mma);
     return e.end - (uintptr_t) dst->data;
 }

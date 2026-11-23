@@ -1,12 +1,29 @@
 # inkling-fast: Inkling-2-Mini on a 12 GB GPU
 
 Branch `inkling-fast2` of llama.cpp, tuned to run [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
-fully on one 12 GB NVIDIA GPU with 64k context. The model file is on Hugging Face:
+fully on one 12 GB NVIDIA GPU: 128k context, image input, and 8 requests at once (chats or OpenCode subagents)
+from one shared KV cache. The model files are on Hugging Face:
 [nahcmon/Inkling-2-Mini-fast-GGUF](https://huggingface.co/nahcmon/Inkling-2-Mini-fast-GGUF).
 
-## Results (RTX 3080 Ti 12 GB, Ryzen 5 5600X, Windows 11)
+## Default setup: 128k context, vision, 8 requests at once
 
-Both runs: 64k context, q4_0 KV cache, same GPU, same benchmark script.
+`Inkling-2-Mini-fast-small.gguf` (9.5 GB) + `mmproj-Inkling-2-Mini-Q8_0.gguf`, 128k shared context, q4_0 KV,
+`-np 8 -kvu -ub 256`. VRAM 11.4 GB with vision loaded. End-to-end HTTP benchmark (256 tokens per
+request, all requests started together, temperature 1.0, mean of 2 rounds):
+
+| requests at once | tok/s each request sees | total tok/s |
+|---:|---:|---:|
+| 1 | 81.6 | 77.9 |
+| 2 | 63.4 | 117.8 |
+| 4 | 42.2 | 155.4 |
+| 8 | 26.7 | **196.5** |
+
+Quality: mean KLD of fast-small vs fast-folded 0.013 (top-1 95.8%); fast-folded matches the original UD-Q4_K_M
+(0.0498 both, table below). The q4_0 KV cache adds 0.007 vs an f16 cache.
+
+## First release: 64k context, one chat
+
+RTX 3080 Ti 12 GB, Ryzen 5 5600X, Windows 11. `Inkling-2-Mini-fast-folded.gguf` (10.1 GiB). Both runs: 64k context, q4_0 KV cache, same GPU, same benchmark script.
 
 | | original (unsloth UD-Q4_K_M, stock llama.cpp) | inkling-fast |
 |---|---:|---:|
@@ -33,8 +50,10 @@ any N. End-to-end HTTP benchmark, 256 tokens per chat, all chats started togethe
 | 4 | 38.3 | 146.6 | 12.0 GB |
 | 8 | 25.6 | **195.7** | 12.0 GB |
 
-`llama-batched-bench` (decode only, no HTTP or prompt processing) reaches 124 / 174 / 237 tok/s at 2 / 4 / 8 chats.
-Before the MoE kernel fix below it was 82 / 98 / 98.
+`llama-batched-bench` (decode only, no HTTP or prompt processing) reaches 124 / 174 / 237 tok/s at 2 / 4 / 8 chats
+(82 / 98 / 98 before the MoE kernel fix below). For a MoE model it overstates real throughput: all its sequences
+share one prompt and decode in lockstep, so they route to the same experts and load fewer expert weights per step
+than independent chats do. Use an end-to-end benchmark with different prompts for real numbers.
 
 ## How the speedup was made
 
@@ -61,10 +80,31 @@ RAM. Most of the gain comes from making it fit; the rest from cutting the number
    more than one token per expert that made it 50x slower (2.2 ms per call at 8 chats). It now has a gate-free
    variant: 8 chats went from 98 to 237 tok/s, one chat is unchanged, output identical (same perplexity).
 8. **Server settings:** `-lm none` loads the model straight into VRAM (no 10 GB memory-mapped copy in RAM),
-   `--cache-ram 0` turns off the RAM prompt cache, q4_0 KV cache, `-ub 512`. `--ctx-checkpoints 2`: Inkling keeps a
+   `--cache-ram 0` turns off the RAM prompt cache, q4_0 KV cache, `-ub 512` (`-ub 256` at 128k). `--ctx-checkpoints 2`: Inkling keeps a
    sliding-window and recurrent state that the server snapshots (~50 MB each) to resume a chat; the default of 32
    per chat let RAM grow by ~400 MB per round with 4 long chats (1.3 to 6 GB). Two per chat is enough to resume the
    next turn without reprocessing, and RAM stays flat.
+9. **A smaller quant for 128k + vision** (`Inkling-2-Mini-fast-small.gguf`, 9.5 GB): expert down NVFP4 to IQ3_XXS
+   (rows padded to the IQ3 block size, importance-matrix weighted), the rest as fast-folded. Frees the VRAM for a
+   128k cache and the Q8_0 vision projector. Tried and rejected: Hadamard-rotated expert down (worse at IQ3_XXS),
+   IQ2_S gate/up, activation-based pruning, sharing K/V between the looped passes (KLD 0.02-0.06).
+10. **No VRAM spill with 8 long prompts:** prefill is split per sequence in the hybrid sliding-window/recurrent
+   memory, and new requests are admitted by the real number of free KV cells.
+11. **Shared prompts are stored once:** with `-kvu`, a request whose prompt shares at least 512 tokens with another
+   running request copies those KV cells and that request's recurrent state instead of processing them again.
+   8 requests with a 5.7k shared prefix: 33.5 s to 6.9 s; 8 OpenCode subagents took a 13.1k system prompt in 7-42 ms
+   each. `LLAMA_KV_FORK=0` turns it off, `LLAMA_KV_FORK_MIN` sets the threshold.
+12. **No f16 copy of the quantized KV cache** (`fattn-banded.cu`, `fattn.cu`): the banded attention kernel dequantizes
+   q4_0 rows while loading its tiles, and decode of up to 8 tokens uses the vector kernel that reads q4_0 directly.
+   At 128k that copy was ~0.5 GB. The relative-position bias is also chunked so the compute buffer never grows past
+   its startup size. VRAM at 8 requests: 11.81 to 11.38 GB, same speed.
+13. **More fusions for parallel decode** (`inkling2.cu`, `topk-moe.cu`): the folded dynamic short convolution
+   (window, state store, taps) is one kernel for any number of sequences, not just one; the MoE router fusion also
+   covers the normalized top-k weights with their epsilon clamp. Checked in `test-backend-ops`
+   (`INKLING2_CONV_DYN_FOLD`, `TOPK_MOE`).
+14. **Speculative decoding tested, not used.** DSpark draft models load in this branch
+   (`-md <draft.gguf> --spec-type draft-dspark`), but on this bandwidth-bound MoE every verified draft token pulls in
+   more experts: 1 chat 72.6 tok/s with 2-token drafts vs ~80 without (58% accepted), 8 chats 58.8 vs ~195 total.
 
 Every engine change was checked against reference logits (KLD, top-1 agreement); none of them changed the output
 beyond float rounding.
@@ -81,14 +121,16 @@ Set `CMAKE_CUDA_ARCHITECTURES` to your GPU (86 = RTX 30xx, 89 = RTX 40xx, 120 = 
 
 ## Run
 
-Put the GGUF next to the scripts (or pass `-ModelDir`), then:
+Put the GGUFs (`Inkling-2-Mini-fast-small.gguf`, `mmproj-Inkling-2-Mini-Q8_0.gguf`, optionally
+`Inkling-2-Mini-fast-folded.gguf` for `-Quality`) next to the scripts (or pass `-ModelDir`), then:
 
 ```
 .\inkling-fast\run-inkling.ps1           # server + web UI at http://127.0.0.1:8080, background
 .\inkling-fast\stop-inkling.ps1
 ```
 
-Options: `-Parallel 4` (4 chats at once, shared KV cache, no extra VRAM), `-Ctx 32768`, `-Foreground`, `-Port`,
+Defaults: 128k context, vision, 8 requests at once, model name `inkling-2-mini` for API clients. Options:
+`-Parallel N`, `-Ctx 65536`, `-NoVision`, `-Quality` (fast-folded, 48k), `-Foreground`, `-Port`, `-LocalOnly`,
 `-CacheRam 4096` (keep older chats in RAM), `-Engine <llama-server.exe>`.
 
 Debug switches: `INKLING2_NO_FORK_FUSE=1` turns the glue fusions off, `INKLING2_FUSE_STATS=1` logs which ones fire.
