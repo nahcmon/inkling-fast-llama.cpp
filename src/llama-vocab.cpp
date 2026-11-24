@@ -22,6 +22,7 @@
 #include <set>
 #include <string_view>
 #include <unordered_map>
+#include <mutex>
 
 //
 // helpers
@@ -2107,6 +2108,16 @@ struct fragment_buffer_variant {
 struct llama_vocab::impl {
     uint32_t n_token_types = 0; // for BERT-style token types
 
+    // [TAG_TOK_CACHE] cache of BPE results per raw-text fragment (fragments are split at special tokens and
+    // tokenized independently, so this is output-identical). Chat requests resend the whole history every turn;
+    // without the cache a 42k-token chat costs ~160 ms of tokenization per request. LLAMA_TOKENIZE_CACHE=0 disables.
+    mutable std::mutex tok_cache_mutex;
+    // least-recently-used eviction: the active chat's messages are touched on every request, so they always stay
+    struct tok_cache_entry { std::vector<llama_token> toks; uint64_t last_use; size_t bytes; };
+    mutable std::unordered_map<std::string, tok_cache_entry> tok_cache;
+    mutable size_t   tok_cache_bytes = 0;
+    mutable uint64_t tok_cache_clock = 0;
+
     std::string tokenizer_model;
     std::string tokenizer_pre;
 
@@ -3897,6 +3908,12 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                     session = std::make_unique<llm_tokenizer_bpe_session>(vocab, *tok_bpe);
                 }
 
+                static const bool tok_cache_on = [] { const char * e = getenv("LLAMA_TOKENIZE_CACHE"); return !e || atoi(e) != 0; }();
+                const bool use_tok_cache = tok_cache_on && vocab.get_tokenizer_model() != "hybriddna" &&
+                                           vocab.get_tokenizer_model() != "whitespace";
+                static constexpr size_t tok_cache_min_len   = 256;               // short fragments are cheap
+                static constexpr size_t tok_cache_max_bytes = 64u * 1024 * 1024;  // keys + values (~25 full 160k-token chats); LRU
+
                 if (add_special) {
                     session->append_bos(output);
                 }
@@ -3918,6 +3935,51 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
 #ifdef PRETOKENIZERDEBUG
                         LLAMA_LOG_WARN("TT: (%ld %ld %ld) '%s'\n", text.length(), fragment.offset, fragment.length, text.c_str());
 #endif
+                        if (use_tok_cache && text.size() >= tok_cache_min_len) {
+                            {
+                                std::lock_guard<std::mutex> lock(tok_cache_mutex);
+                                auto it = tok_cache.find(text);
+                                if (it != tok_cache.end()) {
+                                    it->second.last_use = ++tok_cache_clock;
+                                    output.insert(output.end(), it->second.toks.begin(), it->second.toks.end());
+                                    continue;
+                                }
+                            }
+                            const size_t n0 = output.size();
+                            session->tokenize(text, output);
+                            const size_t bytes = text.size() + (output.size() - n0)*sizeof(llama_token) + 96;
+                            if (bytes > tok_cache_max_bytes/2) {
+                                continue; // a single huge fragment: not worth evicting everything else for
+                            }
+                            std::lock_guard<std::mutex> lock(tok_cache_mutex);
+                            if (tok_cache_bytes + bytes > tok_cache_max_bytes) {
+                                // evict the least recently used fragments (other chats) down to 3/4 of the budget
+                                std::vector<std::pair<uint64_t, const std::string *>> order;
+                                order.reserve(tok_cache.size());
+                                for (const auto & kv : tok_cache) {
+                                    order.emplace_back(kv.second.last_use, &kv.first);
+                                }
+                                std::sort(order.begin(), order.end());
+                                std::vector<std::string> victims;
+                                size_t freed = 0;
+                                for (const auto & o : order) {
+                                    if (tok_cache_bytes - freed + bytes <= tok_cache_max_bytes*3/4) {
+                                        break;
+                                    }
+                                    freed += tok_cache.at(*o.second).bytes;
+                                    victims.push_back(*o.second);
+                                }
+                                for (const auto & v : victims) {
+                                    tok_cache.erase(v);
+                                }
+                                tok_cache_bytes -= freed;
+                            }
+                            tok_cache_entry ent { std::vector<llama_token>(output.begin() + n0, output.end()), ++tok_cache_clock, bytes };
+                            if (tok_cache.emplace(std::move(text), std::move(ent)).second) {
+                                tok_cache_bytes += bytes;
+                            }
+                            continue;
+                        }
                         session->tokenize(text, output);
                     } else { // if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_TOKEN)
                         session->append(fragment.token, output);

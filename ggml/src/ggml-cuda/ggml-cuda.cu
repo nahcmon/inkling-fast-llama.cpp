@@ -895,6 +895,18 @@ ggml_cuda_graph * ggml_backend_cuda_context::cuda_graph(const void * first_node_
 
     auto it = cuda_graphs.find(first_node_ptr);
     if (it == cuda_graphs.end()) {
+        // [TAG_CUDA_GRAPH_MAX] GGML_CUDA_GRAPH_MAX=N: keep at most N captured graphs (least recently used evicted);
+        // each instantiated ~10k-node graph holds device memory, and shape-keyed graphs multiply them
+        static const int graph_max = [] { const char * e = getenv("GGML_CUDA_GRAPH_MAX"); return e ? atoi(e) : 4; }(); // default 4, 0 = unlimited
+        while (graph_max > 0 && (int) cuda_graphs.size() >= graph_max) {
+            auto lru = cuda_graphs.begin();
+            for (auto jt = cuda_graphs.begin(); jt != cuda_graphs.end(); ++jt) {
+                if (jt->second->last_used_time < lru->second->last_used_time) {
+                    lru = jt;
+                }
+            }
+            cuda_graphs.erase(lru);
+        }
         it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
     }
     it->second->last_used_time = time_now;
@@ -3397,8 +3409,28 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
+// [TAG_CUDA_GRAPH_SHAPE_KEY] GGML_CUDA_GRAPH_SHAPE_KEY=1: one CUDA graph per graph shape (node count, tokens), so a
+// short prompt batch and the decode step keep separate captured graphs instead of resetting each other's warmup
+static bool ggml_cuda_graph_shape_key() {
+    static const bool enabled = ggml_cuda_env_int("GGML_CUDA_GRAPH_SHAPE_KEY", 1) != 0; // default on, =0 disables
+    return enabled;
+}
+
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    if (!ggml_cuda_graph_shape_key()) {
+        return cgraph->nodes[0];
+    }
+    uint64_t k = (uint64_t) (uintptr_t) cgraph->nodes[0];
+    k ^= (uint64_t) cgraph->n_nodes * 0x9E3779B97F4A7C15ull;
+    k ^= (uint64_t) cgraph->nodes[0]->ne[1] * 0xC2B2AE3D27D4EB4Full;
+    return (const void *) (uintptr_t) k;
+}
+
+// [TAG_CUDA_GRAPH_EAGER] GGML_CUDA_GRAPH_EAGER=1: capture on the first call of a shape instead of after two warmup
+// calls (a prompt batch of a new size runs only once, so the warmup never completes for it)
+static bool ggml_cuda_graph_eager() {
+    static const bool enabled = ggml_cuda_env_int("GGML_CUDA_GRAPH_EAGER", 1) != 0; // default on, =0 disables
+    return enabled;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -5475,6 +5507,25 @@ struct ggml_cuda_op_prof {
 };
 static ggml_cuda_op_prof g_cuda_op_prof;
 
+// number of tokens of a graph for the profiler filter: ne[1] of the first node named inp_embd*/inp_tokens* (or the max ne[1] of the first nodes)
+static int64_t ggml_cuda_prof_n_tokens(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        const ggml_tensor * t = cgraph->leafs[i];
+        if (strcmp(t->name, "inp_tokens") == 0 || strcmp(t->name, "inp_pos") == 0) {
+            return t->ne[0];
+        }
+    }
+    // scheduler splits carry no leafs: take the row count of the first hidden-state node (GGML_CUDA_OP_PROF_NEMBD, default 2304)
+    static const int64_t n_embd = ggml_cuda_env_int("GGML_CUDA_OP_PROF_NEMBD", 2304);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * t = cgraph->nodes[i];
+        if (t->ne[0] == n_embd && t->ne[2] == 1 && t->ne[3] == 1) {
+            return t->ne[1];
+        }
+    }
+    return INT64_MAX;
+}
+
 static std::string ggml_cuda_op_prof_key(const ggml_tensor * node, int n_fused) {
     std::string name = node->name;
     size_t p = name.find_last_of('-');
@@ -5500,7 +5551,10 @@ static std::string ggml_cuda_op_prof_key(const ggml_tensor * node, int n_fused) 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
-    const bool prof = g_cuda_op_prof.enabled && !use_cuda_graph;
+    // GGML_CUDA_OP_PROF_MAX_TOKENS=N: only profile graphs of at most N tokens (e.g. short prompt batches after a long prefill)
+    static const int64_t prof_max_tok = ggml_cuda_env_int("GGML_CUDA_OP_PROF_MAX_TOKENS", 0);
+    const bool prof = g_cuda_op_prof.enabled && !use_cuda_graph &&
+        (prof_max_tok == 0 || (ggml_cuda_prof_n_tokens(cgraph) <= prof_max_tok && ggml_cuda_prof_n_tokens(cgraph) >= ggml_cuda_env_int("GGML_CUDA_OP_PROF_MIN_TOKENS", 1)));
     cudaEvent_t prof_a = nullptr;
 
     // flag used to determine whether it is an integrated_gpu
@@ -5733,6 +5787,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
             if (prof) {
                 g_cuda_op_prof.flush();
+                // GGML_CUDA_OP_PROF_EVERY=N: print and reset the table every N profiled graphs (for servers)
+                static const int prof_every = ggml_cuda_env_int("GGML_CUDA_OP_PROF_EVERY", 0);
+                static int prof_n = 0;
+                if (prof_every > 0 && ++prof_n % prof_every == 0) {
+                    fprintf(stderr, "[op_prof after %d graphs]", prof_n);
+                    g_cuda_op_prof.print();
+                    g_cuda_op_prof.acc.clear();
+                    fflush(stderr);
+                }
             }
         }
     }
@@ -5789,7 +5852,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (!graph->warmup_complete) {
+            if (ggml_cuda_graph_eager()) {
+                graph->warmup_complete = true;
+                use_cuda_graph = true;
+                cuda_graph_update_required = properties_changed || graph->instances.empty();
+            } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;

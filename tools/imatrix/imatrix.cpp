@@ -86,6 +86,11 @@ private:
     int32_t                                 m_n_layer_nextn = 0;
     std::vector<char>                       m_src1_data;
     std::vector<char>                       m_ids; // the expert ids from ggml_mul_mat_id
+    // [TAG_IMAT_COV] IMAT_COV_DIR: full input covariance per expert tensor (shared by all experts of a layer),
+    // upper triangle in double, for GPTQ-style quantization experiments
+    mutable std::unordered_map<std::string, std::pair<std::vector<double>, int64_t>> m_cov;
+    // [TAG_IMAT_COVX] IMAT_COVX=name1,name2: true per-expert input covariance (f32, upper triangle) for diagnosis
+    mutable std::unordered_map<std::string, std::pair<std::vector<float>, std::vector<int64_t>>> m_covx;
     int32_t e_chunk_size() const {
         return m_chunk_size > 0 ? m_chunk_size : m_params.n_ctx / m_params.n_parallel;
     }
@@ -657,11 +662,40 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
                 e.counts[ex]++;
                 touched[ex] = 1;
+                if (const char * cx = getenv("IMAT_COVX")) { // [TAG_IMAT_COVX]
+                    if ((std::string(",") + cx + ",").find("," + wname + ",") != std::string::npos) {
+                        auto & c = m_covx[wname];
+                        if (c.first.empty()) { c.first.assign((size_t) n_as * ne0 * ne0, 0.0f); c.second.assign(n_as, 0); }
+                        float * base = c.first.data() + (size_t) ex * ne0 * ne0;
+                        for (int64_t i = 0; i < ne0; ++i) {
+                            const float xi = x[i]; float * dst = base + i * ne0;
+                            for (int64_t j = i; j < ne0; ++j) { dst[j] += xi * x[j]; }
+                        }
+                        c.second[ex]++;
+                    }
+                }
                 for (int64_t j = 0; j < ne0; ++j) { acc[j] += x[j] * x[j]; }
                 if (act) {
                     for (int64_t j = 0; j < ne0; ++j) { act[j] += x[j]; }
                 }
             }
+        }
+
+        if (const char * cov_dir = getenv("IMAT_COV_DIR")) { // [TAG_IMAT_COV]
+            auto & c = m_cov[wname];
+            if (c.first.empty()) { c.first.assign((size_t) ne0 * ne0, 0.0); }
+            for (int64_t row = 0; row < n_tokens; ++row) {
+                for (int64_t i11 = 0; i11 < src1->ne[1]; ++i11) {
+                    const float * x = (const float *) (data + i11 * src1->nb[1] + row * src1->nb[2]);
+                    for (int64_t i = 0; i < ne0; ++i) {
+                        const double xi = x[i];
+                        double * dst = c.first.data() + i * ne0;
+                        for (int64_t j = i; j < ne0; ++j) { dst[j] += xi * x[j]; }
+                    }
+                    c.second++;
+                }
+            }
+            GGML_UNUSED(cov_dir);
         }
 
         // check for non-finite values, only checking experts that were routed to and touched
@@ -865,6 +899,34 @@ void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
 }
 
 void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
+    if (const char * cov_dir = getenv("IMAT_COV_DIR")) { // [TAG_IMAT_COV] raw f32 n x n, mean of x x^T
+        for (const auto & [name, c] : m_cov) {
+            const int64_t n = (int64_t) llround(sqrt((double) c.first.size()));
+            std::vector<float> out((size_t) n * n);
+            for (int64_t i = 0; i < n; ++i) for (int64_t j = i; j < n; ++j) {
+                out[i * n + j] = out[j * n + i] = (float) (c.first[i * n + j] / std::max<int64_t>(c.second, 1));
+            }
+            FILE * f = fopen((std::string(cov_dir) + "/" + name + ".cov").c_str(), "wb");
+            if (f) { fwrite(out.data(), sizeof(float), out.size(), f); fclose(f); }
+        }
+    }
+    if (const char * cov_dir = getenv("IMAT_COV_DIR")) { // [TAG_IMAT_COVX] <name>.covx: n_exp x (n x n f32 mean), then n_exp i64 counts
+        for (const auto & [name, c] : m_covx) {
+            const int64_t ne = (int64_t) c.second.size();
+            const int64_t n = (int64_t) llround(sqrt((double) c.first.size() / ne));
+            FILE * f = fopen((std::string(cov_dir) + "/" + name + ".covx").c_str(), "wb");
+            if (!f) continue;
+            std::vector<float> out((size_t) n * n);
+            for (int64_t e = 0; e < ne; ++e) {
+                const float * b = c.first.data() + (size_t) e * n * n;
+                const float k = 1.0f / std::max<int64_t>(c.second[e], 1);
+                for (int64_t i = 0; i < n; ++i) for (int64_t j = i; j < n; ++j) out[i * n + j] = out[j * n + i] = b[i * n + j] * k;
+                fwrite(out.data(), sizeof(float), out.size(), f);
+            }
+            fwrite(c.second.data(), sizeof(int64_t), ne, f);
+            fclose(f);
+        }
+    }
     auto fname = m_params.out_file;
     int8_t use_legacy_format = m_params.imat_dat;
 

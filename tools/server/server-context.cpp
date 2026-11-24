@@ -323,6 +323,9 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // [TAG_CKPT_END] checkpoint the state at the end of the prompt before the first generated token is decoded
+    bool ckpt_end_pending = false;
+
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
@@ -452,6 +455,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        ckpt_end_pending = false;
 
         last_nl_pos    = 0;
         generated      = {};
@@ -4141,6 +4145,16 @@ private:
 
             generating.push_back(&slot);
 
+            // [TAG_CKPT_END] the memory holds exactly the prompt: the first generated token is not decoded yet
+            if (slot.ckpt_end_pending) {
+                slot.ckpt_end_pending = false;
+                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                if (pos_min >= 0 && slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                    create_checkpoint(slot, 0, pos_min, pos_max);
+                }
+            }
+
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
@@ -4756,6 +4770,14 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // [TAG_CKPT_END] LLAMA_SERVER_CKPT_END=1: instead of splitting the prompt tail into extra batches
+                    // (last user message, n - 4 - n_ubatch, n - 4) for checkpoints, process it in one batch and
+                    // checkpoint the state at the end of the prompt, after the first token was sampled and sent.
+                    // for chat templates without a generation prompt (the next turn extends the prompt exactly) this
+                    // keeps the same cache reuse with one batch less per split, and the copy is off the TTFT path.
+                    static const bool ckpt_end = [] { const char * e = getenv("LLAMA_SERVER_CKPT_END"); return !e || atoi(e) != 0; }(); // default on, =0 disables
+                    const bool do_checkpoint_any = do_checkpoint;
+
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
@@ -4810,7 +4832,13 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
+                            if (ckpt_end) {
+                                // only far from the end of the prompt: the tail is covered by the end checkpoint
+                                if (slot.task->n_tokens() - pos > n_ubatch &&
+                                        (checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step)) {
+                                    break;
+                                }
+                            } else if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back()->n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -4820,7 +4848,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        if (do_checkpoint && !ckpt_end) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -4864,6 +4892,8 @@ private:
                         slot.stats.n_gen = 0;
                         slot.i_batch     = batch.size() - 1;
 
+                        slot.ckpt_end_pending = ckpt_end && do_checkpoint_any;
+
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
@@ -4884,6 +4914,12 @@ private:
 
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
+
+                    // [TAG_CKPT_END] the tail of the prompt is covered by the end checkpoint (and restoring the
+                    // checkpoint this batch starts from would only copy it again)
+                    if (ckpt_end && (near_prompt_end || slot.state == SLOT_STATE_DONE_PROMPT)) {
+                        do_checkpoint = false;
+                    }
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
@@ -5672,6 +5708,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // process prompt
         std::vector<server_tokens> inputs;
+        static const bool req_timing = [] { const char * e = getenv("LLAMA_SERVER_TIMING"); return e && atoi(e) != 0; }();
+        const int64_t t_tok0 = ggml_time_us();
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
@@ -5681,6 +5719,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
         }
 
+        const int64_t t_tok1 = ggml_time_us();
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
         for (size_t i = 0; i < inputs.size(); i++) {
@@ -5716,7 +5755,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             tasks.push_back(std::move(task));
         }
 
+        const int64_t t_tok2 = ggml_time_us();
         rd.post_tasks(std::move(tasks), chat_session);
+        if (req_timing) {
+            SRV_WRN("req_timing: tokenize %.2f ms (%zu tokens) | tasks %.2f ms | post %.2f ms\n", (t_tok1 - t_tok0)/1000.0,
+                inputs.empty() ? (size_t) 0 : inputs[0].size(), (t_tok2 - t_tok1)/1000.0, (ggml_time_us() - t_tok2)/1000.0);
+        }
     } catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         return res;
@@ -6346,9 +6390,13 @@ void server_routes::init_routes() {
     };
 
     this->post_chat_completions = [this](const server_http_req & req) {
+        // [TAG_REQ_TIMING] LLAMA_SERVER_TIMING=1: log the host time of each request stage
+        static const bool req_timing = [] { const char * e = getenv("LLAMA_SERVER_TIMING"); return e && atoi(e) != 0; }();
+        const int64_t t_req0 = ggml_time_us();
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+        const int64_t t_req1 = ggml_time_us();
         common_chat_session session;
         json body_parsed = oaicompat_chat_params_parse(
             ctx_server.vocab,
@@ -6356,6 +6404,10 @@ void server_routes::init_routes() {
             meta->chat_params,
             files,
             session);
+        if (req_timing) {
+            SRV_WRN("req_timing: body %zu bytes | json parse %.2f ms | chat parse+render %.2f ms\n", req.body.size(),
+                (t_req1 - t_req0)/1000.0, (ggml_time_us() - t_req1)/1000.0);
+        }
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,

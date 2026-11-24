@@ -496,7 +496,11 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     auto * inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
     auto * attn = inp->get_attn();
     // banded FA needs a position-contiguous cache; small ubatches stay dense for graph reuse
-    inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
+    // [TAG_BANDED_SMALL] a short single-sequence prompt batch (e.g. a chat follow-up) also takes the banded path:
+    // the dense bias costs n_kv x n_tokens x n_head per layer, ~7 ms per token at 42k context
+    static const int64_t n_banded_small_min = [] { const char * e = getenv("LLAMA_INKLING_BANDED_SMALL"); return e ? (int64_t) atoi(e) : (int64_t) 0; }();
+    inp->banded = cparams.flash_attn && (n_tokens > n_tokens_banded_min ||
+        (n_banded_small_min > 0 && n_tokens >= n_banded_small_min && ubatch.n_seqs_unq == 1));
     for (int i = 0; i < 2 && inp->banded; ++i) {
         inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
     }
