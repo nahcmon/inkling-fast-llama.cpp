@@ -23,6 +23,12 @@ Tried and rejected (KLD noise or worse): GPTQ on expert down (all layers 0.0434,
 damping, per-expert covariance shrunk toward the pooled one, re-solving each block's fp16 scale with frozen codes
 (proxy -4.5%, KLD +12%: overfits the calibration set), output.weight in IQ4_XS (+0.0004 for -14.5 MB).
 
+Also rejected (kld.py, layers 6-17 expert gate/up swapped, all through the same Q8_0 round trip, control 0.0429):
+- In-block GPTQ (`gptq_vq.py`: compensation inside each 256 block, group by group): 0.0441, despite a 9-12% lower proxy.
+- ik_llama.cpp trellis IQ2_KT (2.125 bpw, `kt_test.py`): 0.0546.
+- GPTQ on top of IQ2_KT (`gptq_kt.py` + `ik_gptq_kt.cpp`: row scale frozen, one super-block at a time): 0.0515. Saves
+  about 380 MB on those layers but closes only a quarter of the gap, so no CUDA port of the trellis decode.
+
 ## Method (`gptq_build.py`)
 
 Per expert e: `H_e = S_e (C + damp I) S_e`, where C is the layer's input correlation (covariance pooled over all

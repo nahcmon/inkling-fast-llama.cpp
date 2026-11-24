@@ -684,18 +684,90 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         if (const char * cov_dir = getenv("IMAT_COV_DIR")) { // [TAG_IMAT_COV]
             auto & c = m_cov[wname];
             if (c.first.empty()) { c.first.assign((size_t) ne0 * ne0, 0.0); }
-            for (int64_t row = 0; row < n_tokens; ++row) {
-                for (int64_t i11 = 0; i11 < src1->ne[1]; ++i11) {
-                    const float * x = (const float *) (data + i11 * src1->nb[1] + row * src1->nb[2]);
-                    for (int64_t i = 0; i < ne0; ++i) {
-                        const double xi = x[i];
-                        double * dst = c.first.data() + i * ne0;
-                        for (int64_t j = i; j < ne0; ++j) { dst[j] += xi * x[j]; }
-                    }
-                    c.second++;
+            // gather the rows, then C += X^T X (upper triangle) on all cores: 64-row tiles summed in float, added
+            // into the double accumulator; rows split by triangle area so the threads get equal work
+            const int64_t R = n_tokens * src1->ne[1];
+            std::vector<float> X((size_t) R * ne0);
+            for (int64_t row = 0, r = 0; row < n_tokens; ++row) {
+                for (int64_t i11 = 0; i11 < src1->ne[1]; ++i11, ++r) {
+                    memcpy(X.data() + r * ne0, data + i11 * src1->nb[1] + row * src1->nb[2], ne0 * sizeof(float));
                 }
             }
+            c.second += R;
+            const int nt = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+            std::vector<int64_t> bnd(nt + 1, ne0);
+            bnd[0] = 0;
+            {
+                const double tot = 0.5 * (double) ne0 * (ne0 + 1);
+                double cum = 0; int k = 1;
+                for (int64_t i = 0; i < ne0 && k < nt; ++i) {
+                    cum += (double) (ne0 - i);
+                    if (cum >= tot * k / nt) { bnd[k++] = i + 1; }
+                }
+            }
+            auto work = [&](int t) {
+                std::vector<float> tmp(ne0);
+                for (int64_t r0 = 0; r0 < R; r0 += 64) {
+                    const int64_t r1 = std::min<int64_t>(R, r0 + 64);
+                    for (int64_t i = bnd[t]; i < bnd[t + 1]; ++i) {
+                        float * tp = tmp.data();
+                        for (int64_t j = i; j < ne0; ++j) { tp[j] = 0.0f; }
+                        for (int64_t r = r0; r < r1; ++r) {
+                            const float * x = X.data() + r * ne0;
+                            const float xi = x[i];
+                            if (xi == 0.0f) { continue; }
+                            for (int64_t j = i; j < ne0; ++j) { tp[j] += xi * x[j]; }
+                        }
+                        double * dst = c.first.data() + i * ne0;
+                        for (int64_t j = i; j < ne0; ++j) { dst[j] += tp[j]; }
+                    }
+                }
+            };
+            std::vector<std::thread> th;
+            for (int t = 1; t < nt; ++t) { th.emplace_back(work, t); }
+            work(0);
+            for (auto & x : th) { x.join(); }
             GGML_UNUSED(cov_dir);
+        }
+        // [TAG_IMAT_DUMP] IMAT_DUMP_DIR: append the MoE input rows of every ffn_gate_up_exps call (all loop passes) as f16
+        // to <dir>/<tensor>.x16 for block-output reconstruction; IMAT_DUMP_EVERY=N keeps every N-th token
+        if (const char * dump_dir = getenv("IMAT_DUMP_DIR")) {
+            if (wname.find("ffn_gate_up_exps") != std::string::npos) {
+                const char * ev = getenv("IMAT_DUMP_EVERY");
+                const int64_t every = ev ? std::max<int64_t>(1, atoll(ev)) : 1;
+                FILE * f = fopen((std::string(dump_dir) + "/" + wname + ".x16").c_str(), "ab");
+                if (f) {
+                    std::vector<ggml_fp16_t> h(ne0);
+                    for (int64_t row = 0; row < n_tokens; row += every) {
+                        const float * x = (const float *) (data + row * src1->nb[2]);
+                        ggml_fp32_to_fp16_row(x, h.data(), ne0);
+                        fwrite(h.data(), sizeof(ggml_fp16_t), ne0, f);
+                    }
+                    fclose(f);
+                }
+            }
+            // first call of each ffn_down_exps: routing ids and expert inputs of the first 16 tokens, to check a
+            // reimplementation of the MoE block (<tensor>.chk: i32 n_tok, n_ids, ne0; i32 ids; f32 rows)
+            static std::set<std::string> checked;
+            if (wname.find("ffn_down_exps") != std::string::npos && !checked.count(wname)) {
+                checked.insert(wname);
+                FILE * f = fopen((std::string(dump_dir) + "/" + wname + ".chk").c_str(), "wb");
+                if (f) {
+                    const int32_t hdr[3] = { (int32_t) std::min<int64_t>(16, n_tokens), (int32_t) n_ids, (int32_t) ne0 };
+                    fwrite(hdr, 4, 3, f);
+                    for (int64_t row = 0; row < hdr[0]; ++row) {
+                        for (int64_t idx = 0; idx < n_ids; ++idx) {
+                            fwrite(m_ids.data() + row * ids->nb[1] + idx * ids->nb[0], 4, 1, f);
+                        }
+                    }
+                    for (int64_t row = 0; row < hdr[0]; ++row) {
+                        for (int64_t idx = 0; idx < n_ids; ++idx) {
+                            fwrite(data + (idx % src1->ne[1]) * src1->nb[1] + row * src1->nb[2], 4, ne0, f);
+                        }
+                    }
+                    fclose(f);
+                }
+            }
         }
 
         // check for non-finite values, only checking experts that were routed to and touched

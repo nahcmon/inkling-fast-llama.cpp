@@ -15,14 +15,14 @@ import numpy as np
 from multiprocessing import Pool
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-import os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "gguf-py"))
+sys.path.insert(0, r"C:\Users\spiel\Documents\AI\engines\llama.cpp-src\gguf-py")
 import gguf
 from gguf import GGUFReader
 
 
 def _lab():
     src = open(os.path.join(HERE, "gptq_lab.py"), encoding="utf-8").read().split("ap = argparse")[0]
-    g = {"__name__": "lab", "__file__": os.path.join(HERE, "gptq_lab.py")}; exec(src, g); return g
+    g = {"__name__": "lab"}; exec(src, g); return g
 
 
 L = _lab()
@@ -114,6 +114,8 @@ def main():
     ap.add_argument("--experts", type=int, default=0, help="only the first N experts (testing)")
     ap.add_argument("--out", default="gptq")
     ap.add_argument("--refit", action="store_true", help="re-solve each block's fp16 scale with codes frozen")
+    ap.add_argument("--imatrix", help="imatrix file (default imatrix_q8.gguf / imatrix_q8_pad.gguf for down)")
+    ap.add_argument("--cov", default="covg", help="directory with <tensor>.cov layer covariances")
     ap.add_argument("--covx", action="store_true", help="per-expert covariance from covx/<name>.covx, shrunk toward pooled")
     ap.add_argument("--prior", type=float, default=0, help="shrinkage prior count for --covx (default n_in)")
     a = ap.parse_args()
@@ -122,7 +124,7 @@ def main():
     for part in a.layers.split(","):
         lo, _, hi = part.partition("-"); layers += list(range(int(lo), int(hi or lo) + 1))
     src = "../cmp/Inkling-2-Mini-UD-Q8_K_XL.gguf" if a.tensor == "gate_up" else "down_f16.gguf"
-    imf = "imatrix_q8.gguf" if a.tensor == "gate_up" else "imatrix_q8_pad.gguf"
+    imf = a.imatrix or ("imatrix_q8.gguf" if a.tensor == "gate_up" else "imatrix_q8_pad.gguf")
     rs = {t.name: t for t in GGUFReader(src).tensors}
     ims = {t.name: np.asarray(t.data) for t in GGUFReader(imf).tensors}
     os.makedirs(a.out, exist_ok=True)
@@ -135,7 +137,7 @@ def main():
         t = rs[name]; n_in, n_out, n_exp = (int(v) for v in t.shape)
         s2 = ims[name + ".in_sum2"].reshape(n_exp, -1).astype(np.float64)
         cnt = ims[name + ".counts"].reshape(n_exp).astype(np.float64)
-        cov = np.fromfile(f"covg/{name}.cov", np.float32)
+        cov = np.fromfile(f"{a.cov}/{name}.cov", np.float32)
         nc = int(round(np.sqrt(cov.size))); cov = cov.reshape(nc, nc).astype(np.float64)
         gd = np.diag(cov).copy()
         d = np.where(cnt[:, None] > 0, s2 / np.maximum(cnt, 1)[:, None], np.pad(gd, (0, n_in - nc))[None, :])
