@@ -64,6 +64,11 @@ if ($Quality) {
     # IQ2_XS expert gate/up, original NVFP4 expert down, Q6_K attention (10.9 GB)
     if (-not $Ctx) { $Ctx = 49152 }
     $model = Join-Path $ModelDir "Inkling-2-Mini-fast-folded.gguf"
+} elseif (Test-Path (Join-Path $ModelDir "Inkling-2-Mini-fast-9.2-gptq.gguf")) {
+    # bits per layer group by measured sensitivity, GPTQ-style error compensation on expert gate/up, Q5_K attention,
+    # BF16 loop/router weights (9.24 GB, KLD 0.043 - closer to the original than fast-folded): 160k context
+    if (-not $Ctx) { $Ctx = 163840 }
+    $model = Join-Path $ModelDir "Inkling-2-Mini-fast-9.2-gptq.gguf"
 } else {
     # IQ2_XS expert gate/up, IQ3_XXS expert down, Q6_K attention, BF16 loop/router weights (9.5 GB)
     if (-not $Ctx) { $Ctx = 131072 }

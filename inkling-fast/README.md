@@ -1,4 +1,4 @@
-# inkling-fast: Inkling-2-Mini on a 12 GB GPU
+﻿# inkling-fast: Inkling-2-Mini on a 12 GB GPU
 
 Branch `inkling-fast2` of llama.cpp, tuned to run [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 fully on one 12 GB NVIDIA GPU: 128k context, image input, and 8 requests at once (chats or OpenCode subagents)
@@ -130,6 +130,12 @@ RAM. Most of the gain comes from making it fit; the rest from cutting the number
    ~160 ms. The text between special tokens is tokenized independently, so its tokens are cached per piece (64 MB,
    least recently used dropped first). The active chat stays cached; output is identical. `LLAMA_TOKENIZE_CACHE=0`
    turns it off.
+
+18. **GPTQ-style quantizer** (`inkling-fast/quant/`): expert gate/up bits are placed per layer group by measured
+   sensitivity, and each 256-column block's quantization error is compensated in the columns not yet quantized,
+   using the layer's input covariance recorded by `llama-imatrix` (`IMAT_COV_DIR`). Same 9.24 GB, mean KLD
+   0.0491 to 0.0428 (kld.py), same speed. `run-inkling.ps1` uses `Inkling-2-Mini-fast-9.2-gptq.gguf` with a 160k
+   context when it is present. Details and rejected variants in `quant/README.md`.
 
 Every engine change was checked against reference logits (KLD, top-1 agreement); none of them changed the output
 beyond float rounding.
