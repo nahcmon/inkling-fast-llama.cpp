@@ -455,6 +455,12 @@ typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor *
 static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K_in, const ggml_type type_V_in) {
     const ggml_type type_K = type_K_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_K_in;
     const ggml_type type_V = type_V_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_V_in;
+    // The D=128 q3_0 instance can also read q4_0 on either side.
+    if (head_size == 128 &&
+        ((type_K == GGML_TYPE_Q3_0 && (type_V == GGML_TYPE_Q3_0 || type_V == GGML_TYPE_Q4_0)) ||
+         (type_K == GGML_TYPE_Q4_0 && type_V == GGML_TYPE_Q3_0))) {
+        return ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_Q3_0, GGML_TYPE_Q3_0>;
+    }
     FATTN_VEC_CASES_ALL_D(F16,  F16)
     FATTN_VEC_CASES_ALL_D(Q4_0, F16)
     FATTN_VEC_CASES_ALL_D(Q4_1, F16)
@@ -564,6 +570,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_Q3_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -731,6 +738,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    if (can_use_vector_kernel && Q->ne[0] == 128 &&
+        (K->type == GGML_TYPE_Q3_0 || V->type == GGML_TYPE_Q3_0) && Q->ne[1] <= 8 &&
+        ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type)) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc)) {

@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 //
 // llama_kv_cache_iswa
@@ -92,8 +95,38 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
     }
 
+    ggml_type type_k_base = type_k;
+    ggml_type type_v_base = type_v;
+    if (const char * env = getenv("LLAMA_KV_TYPE_GLOBAL")) {
+        const std::string value(env);
+        const size_t sep = value.find(',');
+        const auto parse_type = [](const std::string & name) {
+            for (const ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q3_0,
+                    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+                if (name == ggml_type_name(type)) {
+                    return type;
+                }
+            }
+            throw std::invalid_argument("invalid LLAMA_KV_TYPE_GLOBAL cache type: " + name);
+        };
+        type_k_base = parse_type(value.substr(0, sep));
+        type_v_base = sep == std::string::npos ? type_k_base : parse_type(value.substr(sep + 1));
+        if (v_trans && ggml_is_quantized(type_v_base)) {
+            throw std::invalid_argument("LLAMA_KV_TYPE_GLOBAL with quantized V requires flash attention");
+        }
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.has_kv(il) && filter_base(il) &&
+                (hparams.n_embd_head_k(il) % ggml_blck_size(type_k_base) != 0 ||
+                 (!hparams.is_mla() && hparams.n_embd_head_v(il) % ggml_blck_size(type_v_base) != 0))) {
+                throw std::invalid_argument("LLAMA_KV_TYPE_GLOBAL block size does not divide the attention head size");
+            }
+        }
+        LLAMA_LOG_INFO("%s: LLAMA_KV_TYPE_GLOBAL overrides non-SWA K = %s, V = %s\n",
+                __func__, ggml_type_name(type_k_base), ggml_type_name(type_v_base));
+    }
+
     kv_base = std::make_unique<llama_kv_cache>(
-            model, no_alloc, hparams, type_k, type_v,
+            model, no_alloc, hparams, type_k_base, type_v_base,
             v_trans, offload, unified, size_base, n_seq_max,
             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,
             // experiment GGML_KV_FAKEQ (set-rows.cu) finds the global cache by this tag

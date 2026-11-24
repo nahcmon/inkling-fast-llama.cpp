@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "dequantize.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -40,7 +41,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const ggml_type cache_type_k, const ggml_type cache_type_v);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -171,6 +173,29 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f8_e4m3(
         }
     }
 
+    return sum;
+}
+
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q3_0(
+    const char * __restrict__ K_c, const void * __restrict__, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_q3_0 * K = (const block_q3_0 *) K_c;
+    float sum = 0.0f;
+#pragma unroll
+    for (int k0 = 0; k0 < D/4; k0 += nthreads) {
+        const int k = k0 + threadIdx.x % nthreads;
+        const block_q3_0 & b = K[k / QI8_1];
+        const int j = (k % QI8_1)*4;
+        int packed = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            packed |= (unpack_q3_0(b, j + l) + 8) << (8*l);
+        }
+        const int dot = ggml_cuda_dp4a(packed, Q_q8[k0/nthreads], 0);
+        const float2 q = ((const float2 *) Q_ds_v)[k0/nthreads];
+        // Match q4_0's offset and use the original query sum for its correction.
+        sum += __half2float(b.d) * (dot*q.x - (8/QI8_1)*q.y);
+    }
     return sum;
 }
 
@@ -493,6 +518,17 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
 }
 
 template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_q3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_q3_0 & b = ((const block_q3_0 *) vx)[i0 / QK3_0];
+    const float d = __half2float(b.d);
+    static_assert(ne == 4, "bad ne");
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        ((T *) dst)[l] = ggml_cuda_cast<T>(d * unpack_q3_0(b, i0 % QK3_0 + l));
+    }
+}
+
+template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q4_1 * x = (const block_q4_1 *) vx;
 
@@ -673,6 +709,8 @@ template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_Q3_0) {
+        return vec_dot_fattn_vec_KQ_q3_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
@@ -697,6 +735,8 @@ template <ggml_type type_V, typename T, int ne>
 constexpr __device__ dequantize_V_t get_dequantize_V() {
     if constexpr (type_V == GGML_TYPE_F16) {
         return dequantize_V_f16<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_Q3_0) {
+        return dequantize_V_q3_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_0) {
         return dequantize_V_q4_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_1) {
@@ -1333,7 +1373,8 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        K->type, V->type
     );
     CUDA_CHECK(cudaGetLastError());
 

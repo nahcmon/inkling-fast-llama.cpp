@@ -40,7 +40,8 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const ggml_type cache_type_k, const ggml_type cache_type_v) {
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -102,6 +103,20 @@ static __global__ void flash_attn_ext_vec(
 #else
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
 #endif // V_DOT2_F32_F16_AVAILABLE
+
+    const auto load_v = [&](const void * src, void * dst, int64_t i) {
+        if constexpr (type_V == GGML_TYPE_Q3_0) {
+            if (cache_type_v == GGML_TYPE_Q4_0) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                dequantize_V_q4_0<half, V_rows_per_thread>(src, dst, i);
+#else
+                dequantize_V_q4_0<float, V_rows_per_thread>(src, dst, i);
+#endif
+                return;
+            }
+        }
+        dequantize_V(src, dst, i);
+    };
 
     const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
 
@@ -293,7 +308,15 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                const char * row_k = K + i_KQ*nb11;
+                float sum;
+                if constexpr (type_K == GGML_TYPE_Q3_0) {
+                    sum = cache_type_k == GGML_TYPE_Q4_0 ?
+                        vec_dot_fattn_vec_KQ_q4_0<D, nthreads_KQ>(row_k, Q_reg[j], Q_i32[j], Q_ds[j]) :
+                        vec_dot_KQ(row_k, Q_reg[j], Q_i32[j], Q_ds[j]);
+                } else {
+                    sum = vec_dot_KQ(row_k, Q_reg[j], Q_i32[j], Q_ds[j]);
+                }
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
@@ -357,14 +380,14 @@ static __global__ void flash_attn_ext_vec(
                 half2 tmp[V_rows_per_thread/2];
                 if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp_f,
+                    load_v(V + k*nb21, tmp_f,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp,
+                    load_v(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
 #pragma unroll
@@ -384,7 +407,7 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
+                load_v(V + k*nb21, tmp,
                     2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -599,6 +622,8 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 #define DECL_FATTN_VEC_CASE(D, type_K, type_V)                              \
     template void ggml_cuda_flash_attn_ext_vec_case                         \
     <D, type_K, type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q3_0, GGML_TYPE_Q3_0);
 
 #define EXTERN_DECL_FATTN_VEC_CASES(D, type_K)             \
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_F16);  \

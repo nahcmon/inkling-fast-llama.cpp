@@ -555,7 +555,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         // quantized caches are dequantized to f16 by the banded MMA kernel
         const auto type_ok = [](ggml_type t) {
             return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 ||
-                   t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 || t == GGML_TYPE_Q8_0;
+                   t == GGML_TYPE_Q3_0 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 || t == GGML_TYPE_Q8_0;
         };
         const bool gather = swa_gather(swa);
         if (!((inp->n_kv_banded[swa] > 0 || gather || base_gather(swa)) && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
@@ -865,6 +865,11 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 const int64_t n_rows_res = std::max<int64_t>(1, std::min<int64_t>(cparams.n_seq_max, cparams.n_ubatch)/n_stream);
                 const int64_t n_rows_cap = std::max<int64_t>(1, std::min(n_rows_res, n_kq_bias_max/(n_kv_max*n_head*n_stream)));
                 int64_t n_rows_max = std::max(n_rows_cap, (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max);
+                const auto * cache = is_swa ? attn->mctx->get_swa() : attn->mctx->get_base();
+                if (cache->type_k() == GGML_TYPE_Q3_0 || cache->type_v() == GGML_TYPE_Q3_0) {
+                    // The packed q3_0 vector kernel handles up to eight query rows.
+                    n_rows_max = std::min<int64_t>(n_rows_max, 8);
+                }
                 if (n_rows_max < n_seq_tokens) {
                     const int64_t n_chunks = (n_seq_tokens + n_rows_max - 1)/n_rows_max;
                     const int64_t n_rows   = (n_seq_tokens + n_chunks - 1)/n_chunks;

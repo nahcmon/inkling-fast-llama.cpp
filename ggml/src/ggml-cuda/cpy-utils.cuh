@@ -14,6 +14,62 @@ static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val,
     return x - val[mu-1] < val[mu] - x ? mu-1 : mu;
 }
 
+// Use the same scale search and ties as GGML_KV_FAKEQ's u3 grid.
+static __device__ void quantize_f32_q3_0_block(const float * __restrict__ x, block_q3_0 * __restrict__ y) {
+    float amax = 0.0f, vmax = 0.0f;
+    for (int j = 0; j < QK3_0; ++j) {
+        if (amax < fabsf(x[j])) {
+            amax = fabsf(x[j]);
+            vmax = x[j];
+        }
+    }
+    const float d0 = vmax / -4.0f;
+    float best_d = d0, best_e = 3.4e38f;
+    for (int c = 0; c < 13; ++c) {
+        const float d = d0 * (0.6f + 0.05f * c);
+        if (d == 0.0f) {
+            break;
+        }
+        const float id = 1.0f / d;
+        float e = 0.0f;
+        for (int j = 0; j < QK3_0; ++j) {
+            const float v = x[j] * id;
+            float bd = 1e30f;
+            for (int k = -4; k <= 3; ++k) {
+                const float t = (v - k) * (v - k);
+                bd = fminf(bd, t);
+            }
+            e += bd * d * d;
+        }
+        if (e < best_e) {
+            best_e = e;
+            best_d = d;
+        }
+    }
+
+    y->d = best_d;
+    const float id = best_d ? 1.0f / best_d : 0.0f;
+    for (int j = 0; j < QK3_0; j += 8) {
+        y->qs[j/4] = 0;
+        y->qs[j/4 + 1] = 0;
+        y->qh[j/8] = 0;
+        for (int l = 0; l < 8; ++l) {
+            const float v = x[j + l] * id;
+            int code = 0;
+            float bd = 1e30f;
+            for (int k = 0; k < 8; ++k) {
+                const float t = (v - (k - 4)) * (v - (k - 4));
+                if (t < bd) {
+                    bd = t;
+                    code = k;
+                }
+            }
+            y->qs[(j + l)/4] |= (code & 3) << (2*(l % 4));
+            y->qh[j/8] |= (code >> 2) << l;
+        }
+    }
+}
+
 static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, block_q4_0 * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;
@@ -187,6 +243,10 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
 }
 
 // Wrapper functions for cpy.cu compatibility
+static __device__ void cpy_blck_f32_q3_0(const char * cxi, char * cdsti) {
+    quantize_f32_q3_0_block((const float *)cxi, (block_q3_0 *)cdsti);
+}
+
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
 }

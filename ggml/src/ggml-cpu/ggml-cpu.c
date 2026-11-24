@@ -7,6 +7,7 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
+#include "ggml-quants.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
@@ -215,6 +216,25 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+static void ggml_vec_dot_q3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1 && n % QK3_0 == 0);
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    const block_q3_0 * x = vx;
+    const float * y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK3_0; ++i) {
+        float block[QK3_0];
+        float dot;
+        dequantize_row_q3_0(x + i, block, QK3_0);
+        ggml_vec_dot_f32(QK3_0, &dot, 0, block, 0, y + i*QK3_0, 0, 1);
+        sum += dot;
+    }
+    *s = sum;
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -238,6 +258,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q2_0,
         .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q3_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_q3_0_ref,
+        .vec_dot                  = ggml_vec_dot_q3_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q4_0] = {

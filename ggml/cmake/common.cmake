@@ -97,6 +97,7 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
             list(APPEND FA_COMBINATIONS ${TYPE_K}-${TYPE_V})
         endforeach()
     endif()
+    list(APPEND FA_COMBINATIONS q3_0-q3_0)
     list(REMOVE_DUPLICATES FA_COMBINATIONS)
 
     string(REPLACE ";" "," FA_QUANTS_DEFINE "${FA_QUANTS}")
