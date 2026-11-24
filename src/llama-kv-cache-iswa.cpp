@@ -95,7 +95,9 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
+            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,
+            // experiment GGML_KV_FAKEQ (set-rows.cu) finds the global cache by this tag
+            getenv("GGML_KV_FAKEQ") ? "g" : "");
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 

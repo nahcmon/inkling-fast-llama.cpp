@@ -3,6 +3,66 @@
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
+// Experiment (GGML_KV_FAKEQ="K,V", each q4|u3|n3|u2): store the global KV cache as q4_0 blocks whose codes are
+// limited to a 3- or 2-bit grid, to measure the quality of a 3/2-bit cache before writing real kernels.
+//   u3: uniform 8 levels -4..3, n3: nonuniform 8 levels +-1,2,4,7, u2: uniform 4 levels -2..1.
+// The scale is the one (of 13 tried) with the least squared error.
+template <int G>
+static __device__ void quantize_f32_fakeq_block(const float * __restrict__ x, block_q4_0 * __restrict__ y) {
+    constexpr int NL = G == 2 ? 4 : 8;
+    const int L[8] = { G == 0 ? -4 : G == 1 ? -7 : -2, G == 0 ? -3 : G == 1 ? -4 : -1, G == 0 ? -2 : G == 1 ? -2 : 0,
+                       G == 0 ? -1 : G == 1 ? -1 : 1,  G == 0 ? 0 : 1, G == 0 ? 1 : 2, G == 0 ? 2 : 4, G == 0 ? 3 : 7 };
+    const float lneg = G == 0 ? 4.0f : G == 1 ? 7.0f : 2.0f;
+    float amax = 0.0f, vmax = 0.0f;
+    for (int j = 0; j < QK4_0; ++j) {
+        if (amax < fabsf(x[j])) { amax = fabsf(x[j]); vmax = x[j]; }
+    }
+    // the largest magnitude maps to the most negative level (or its mirror for the symmetric grid)
+    const float d0 = G == 1 ? amax / lneg : vmax / -lneg;
+    float best_d = d0, best_e = 3.4e38f;
+    for (int c = 0; c < 13; ++c) {
+        const float d = d0 * (0.6f + 0.05f * c);
+        if (d == 0.0f) { break; }
+        const float id = 1.0f / d;
+        float e = 0.0f;
+        for (int j = 0; j < QK4_0; ++j) {
+            const float v = x[j] * id;
+            float bd = 1e30f;
+            for (int k = 0; k < NL; ++k) { const float t = (v - L[k]) * (v - L[k]); bd = fminf(bd, t); }
+            e += bd * d * d;
+        }
+        if (e < best_e) { best_e = e; best_d = d; }
+    }
+    y->d = best_d;
+    const float id = best_d ? 1.0f / best_d : 0.0f;
+    uint8_t q[QK4_0];
+    for (int j = 0; j < QK4_0; ++j) {
+        const float v = x[j] * id;
+        int bk = 0; float bd = 1e30f;
+        for (int k = 0; k < NL; ++k) { const float t = (v - L[k]) * (v - L[k]); if (t < bd) { bd = t; bk = k; } }
+        q[j] = (uint8_t) (L[bk] + 8);
+    }
+    for (int j = 0; j < QK4_0/2; ++j) {
+        y->qs[j] = q[j] | (q[QK4_0/2 + j] << 4);
+    }
+}
+
+// 0 = normal q4_0, else 1 + grid (u3, n3, u2), for the global K and V caches
+static int fakeq_mode(const ggml_tensor * dst) {
+    static int mk = -1, mv = -1;
+    if (mk < 0) {
+        mk = mv = 0;
+        const char * e = getenv("GGML_KV_FAKEQ");
+        auto parse = [](const char * s) { return !strncmp(s, "u3", 2) ? 1 : !strncmp(s, "n3", 2) ? 2 : !strncmp(s, "u2", 2) ? 3 : 0; };
+        if (e) { mk = parse(e); const char * c = strchr(e, ','); mv = c ? parse(c + 1) : mk; }
+    }
+    const ggml_tensor * t = dst;
+    while (t->view_src) { t = t->view_src; }
+    if (!strncmp(t->name, "cache_gk_", 9)) { return mk; }
+    if (!strncmp(t->name, "cache_gv_", 9)) { return mv; }
+    return 0;
+}
+
 // Generic quantized set_rows kernel template
 template <typename src_t, typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *)>
 static __global__ void k_set_rows_quant(const src_t * __restrict__ src0,
@@ -277,6 +337,13 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_Q4_0 && fakeq_mode(dst) != 0) {
+        const int m = fakeq_mode(dst);
+#define FAKEQ_CALL(F) set_rows_cuda_quant<src_t, idx_t, block_q4_0, QK4_0, F>(             src0_d, src1_d, (block_q4_0*)dst->data, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,             nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream)
+        if (m == 1) { FAKEQ_CALL(quantize_f32_fakeq_block<0>); }
+        else if (m == 2) { FAKEQ_CALL(quantize_f32_fakeq_block<1>); }
+        else { FAKEQ_CALL(quantize_f32_fakeq_block<2>); }
+#undef FAKEQ_CALL
     } else if (dst->type == GGML_TYPE_Q4_0) {
         set_rows_cuda_quant<src_t, idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
             src0_d, src1_d, (block_q4_0*)dst->data,
