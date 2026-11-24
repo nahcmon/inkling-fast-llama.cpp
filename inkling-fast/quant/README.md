@@ -19,6 +19,22 @@ and were never used to pick a winner.
 Same bits, 12.7% lower KLD; same speed (bench.py 83.0 vs 83.6 tok/s) and VRAM. With GPTQ a 8.98 GB recipe reaches
 0.0474, better than the uncompensated 9.24 GB file.
 
+### Round 2: `Inkling-2-Mini-fast-9.3-tuned.gguf` (same 9.24 GB, same tensor types and speed)
+
+| step | mean KLD | KLD99 | top-1 |
+|---|---:|---:|---:|
+| 9.2-gptq (above) | 0.04282 | 0.4240 | 92.92% |
+| + MoE block-output scale tuning only (`moe_recon.py`) | 0.04106 | 0.4065 | 92.84% |
+| GPTQ rebuilt with a 3x larger chat + docs calibration only | 0.04100 | 0.3924 | 92.76% |
+| **both (scale tuning on top of the new GPTQ file)** | **0.03909** | **0.3703** | **93.10%** |
+
+Calibration: `cmp/calib2.txt` (1.4 MB, chat transcripts + the old docs text), imatrix run with `IMAT_DUMP_DIR`
+(`IMAT_DUMP_EVERY=8`), layer covariance from that dump (`cov_from_dump.py`), `gptq_build.py --imatrix imatrix2.gguf
+--cov covg2 --damp 1.0`, then `moe_recon.py --cand <that file> --layers 0-23 --epochs 8` (about 50 min on the 3080 Ti):
+per layer the fp16 block scales of expert gate/up and down get learned log-multipliers (codes frozen) so the MoE
+block output, routing and activation included, matches the Q8 reference on the dumped inputs; held-out MoE error
+drops 7-19% per layer. llama-bench: 89.0 vs 89.2 tok/s decode, 2459 vs 2490 tok/s pp512.
+
 Tried and rejected (KLD noise or worse): GPTQ on expert down (all layers 0.0434, layers 0-5 hurt), per-layer-group
 damping, per-expert covariance shrunk toward the pooled one, re-solving each block's fp16 scale with frozen codes
 (proxy -4.5%, KLD +12%: overfits the calibration set), output.weight in IQ4_XS (+0.0004 for -14.5 MB).
