@@ -814,7 +814,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 ggml_tensor *& mc = banded_mask[is_swa ? 1 : 0];
                 if (!mc || mc->ne[0] != n_kv_b) {
                     ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
-                    mc = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
+                    // the whole mask needs no copy: at 256k context the copy was 128 MiB of compute buffer
+                    mc = mask->ne[0] == n_kv_b ? mask :
+                        ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
                             mask->nb[1], mask->nb[2], mask->nb[3], 0));
                 }
                 m = mc;
