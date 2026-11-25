@@ -1681,6 +1681,27 @@ json oaicompat_chat_params_parse(
         if (reasoning_budget == -1) {
             reasoning_budget = opt.reasoning_budget;
         }
+        // reasoning off: a template that cannot switch reasoning off still lets the model open a thinking block (with
+        // tools the parser cannot open the answer block for it), so ban the token that opens one. a budget of 0 does
+        // not work: the model opens a new thinking block after every forced end
+        const std::string & think_tag = out_session.thinking_start_tag();
+        if (reasoning_off_requested && !think_tag.empty()) {
+            const auto think_toks = common_tokenize(vocab, think_tag, false, true);
+            if (think_toks.size() == 1) {
+                json bias = json::array();
+                if (body.contains("logit_bias") && body.at("logit_bias").is_array()) {
+                    bias = body.at("logit_bias");
+                } else if (body.contains("logit_bias") && body.at("logit_bias").is_object()) {
+                    for (const auto & el : body.at("logit_bias").items()) {
+                        char * end;
+                        const long tok = strtol(el.key().c_str(), &end, 10);
+                        bias.push_back(json::array({ *end == 0 ? json(tok) : json(el.key()), el.value() }));
+                    }
+                }
+                bias.push_back(json::array({ think_toks[0], false }));
+                llama_params["logit_bias"] = bias;
+            }
+        }
 
         if (!out_session.thinking_end_tags().empty()) {
             llama_params["reasoning_budget_tokens"] = reasoning_budget;

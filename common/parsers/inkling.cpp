@@ -100,9 +100,11 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
     auto use_tools           = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
     // the template has no switch for reasoning (its effort level is only a hint: effort 0 still thinks), so reasoning
-    // off opens the answer block for the model. not with tools: a turn may start with a tool call
-    if (!inputs.enable_thinking && !inputs.has_continuation() && inputs.add_generation_prompt && !use_tools) {
-        const std::string open = string_ends_with(data.generation_prompt, HEADER) ? TEXT : HEADER + TEXT;
+    // off opens the answer block for the model. with tools it gets an empty thinking block instead: after a text block
+    // the model ends the turn without the tool call. the server bans the token that opens a thinking block
+    if (!inputs.enable_thinking && !inputs.has_continuation() && inputs.add_generation_prompt) {
+        const std::string head = string_ends_with(data.generation_prompt, HEADER) ? "" : HEADER;
+        const std::string open = head + (use_tools ? THINK + END : TEXT);
         data.generation_prompt += open;
         data.prompt.append(open);
     }
