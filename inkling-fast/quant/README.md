@@ -76,3 +76,6 @@ python assemble.py Inkling-2-Mini-fast-small.gguf Inkling-2-Mini-fast-9.2-gptq.g
 ```
 
 ~1 min per layer on a Ryzen 5 5600X (6 workers). `LLAMA_BIN` points the scripts at another build.
+
+- `realtest.py` measures decode, prefill, and GPU shared memory in a five-turn vision chat. Use `--model-dir` to point it at the deployed model folder.
+- `vspeed_long.py` checks uncached long prompts and 128-token decode. Use `--model-dir` for the vision projector, `--corpus` for the prompt text, and `--ub 512 --kv-global q4_0` for Long.

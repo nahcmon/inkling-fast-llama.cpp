@@ -53,6 +53,29 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+static inline bool ggml_cuda_fattn_mma_direct_kv(const int cc, const ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const auto is_supported = [](ggml_type type) {
+        return type == GGML_TYPE_Q3_0 || type == GGML_TYPE_Q4_0;
+    };
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && q->ne[1] > 8 &&
+            (k->ne[0] == 64 || k->ne[0] == 128) && k->ne[0] == v->ne[0] &&
+            is_supported(k->type) && is_supported(v->type)) {
+        static const bool enabled = [] {
+            const char * env = getenv("LLAMA_FA_KV_CHUNK");
+            return !env || strcmp(env, "0") != 0;
+        }();
+        return enabled;
+    }
+#else
+    GGML_UNUSED_VARS(cc, dst);
+#endif
+    return false;
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
@@ -1374,7 +1397,7 @@ void launch_fattn(
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        K->type, V->type
+        need_f16_K ? GGML_TYPE_F16 : K->type, need_f16_V ? GGML_TYPE_F16 : V->type
     );
     CUDA_CHECK(cudaGetLastError());
 

@@ -8965,6 +8965,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * rel     = dst->src[6];
+    const int32_t window = rel ? ggml_get_op_params_i32(dst, 4) : 0;
     const ggml_tensor * kv_rows = dst->src[5];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
@@ -9074,7 +9075,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        const int64_t q_pos = iq1 + nek1 - neq1;
+        const int64_t i_begin = window > 0 ? std::max(ic_start, q_pos - window + 1) : ic_start;
+        const int64_t i_end   = window != 0 ? std::min(ic_end, q_pos + 1) : ic_end;
+        for (int64_t ic = i_begin; ic < i_end; ++ic) {
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -9098,7 +9102,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             if (rel) {
                 // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention)
-                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+                const int64_t rel_dist = q_pos - ic;
                 if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
                     s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
                 }

@@ -5526,6 +5526,13 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     return result;
 }
 
+void ggml_flash_attn_ext_banded_set_window(struct ggml_tensor * a, int32_t window) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(a->src[3] == NULL && a->src[0]->ne[1] <= a->src[1]->ne[1]);
+    GGML_ASSERT(window == -1 || window > 0);
+    ggml_set_op_params_i32(a, 4, window);
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,

@@ -1,4 +1,4 @@
-﻿# inkling-fast: Inkling-2-Mini on a 12 GB GPU
+# inkling-fast: Inkling-2-Mini on a 12 GB GPU
 
 Branch `inkling-fast2` of llama.cpp, tuned to run [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 fully on one 12 GB NVIDIA GPU: 128k context, image input, and 8 requests at once (chats or OpenCode subagents)
@@ -152,16 +152,29 @@ Set `CMAKE_CUDA_ARCHITECTURES` to your GPU (86 = RTX 30xx, 89 = RTX 40xx, 120 = 
 
 ## Run
 
-Put the GGUFs (`Inkling-2-Mini-fast-small.gguf`, `mmproj-Inkling-2-Mini-Q8_0.gguf`, optionally
-`Inkling-2-Mini-fast-folded.gguf` for `-Quality`) next to the scripts (or pass `-ModelDir`), then:
+Place the model GGUFs and the Q8 vision projector next to the scripts, or pass a folder with -ModelDir.
+Standard and Fast use Inkling-2-Mini-fast-9.3-tuned.gguf. Long uses Inkling-2-Mini-fast-long.gguf.
 
-```
-.\inkling-fast\run-inkling.ps1           # server + web UI at http://127.0.0.1:8080, background
+~~~powershell
+.\inkling-fast\run-inkling.ps1
 .\inkling-fast\stop-inkling.ps1
-```
+~~~
 
-Defaults: 128k context, vision, 8 requests at once, model name `inkling-2-mini` for API clients. Options:
-`-Parallel N`, `-Ctx 65536`, `-NoVision`, `-Quality` (fast-folded, 48k), `-Foreground`, `-Port`, `-LocalOnly`,
-`-CacheRam 4096` (keep older chats in RAM), `-Engine <llama-server.exe>`.
+The launcher offers three modes. Decode numbers cover the first reply and a follow-up at about 9k tokens.
+Prompt throughput is from the paste turn in the two-image chat. Top-1 measures agreement with the Q8 reference.
+All three modes use a 512-token microbatch and q4_0 K/V.
+
+| Mode | Context | Writes (tok/s) | Reads prompts (tok/s) | Top-1 |
+| --- | ---: | ---: | ---: | ---: |
+| Standard (default) | 128k | 84 -> 74 | ~1842 | 92.8% |
+| Fast | 64k | 84 -> 74 | ~1827 | 92.8% |
+| Long | 256k | 85 -> 75 | ~1757 | 92.4% |
+
+Use -Mode Standard, -Mode Fast, or -Mode Long to skip the menu. The server defaults to vision, eight parallel
+requests, and the inkling-2-mini API alias. Other options include -Parallel, -Ctx, -NoVision, -Foreground,
+-Port, -LocalOnly, -CacheRam, and -Engine.
+
+Prefill uses implicit causal bounds for contiguous or position-ordered K/V and dequantizes q3_0/q4_0 tiles in shared memory.
+Set `LLAMA_FA_KV_CHUNK=0` to compare against the dense-mask and staged-conversion paths.
 
 Debug switches: `INKLING2_NO_FORK_FUSE=1` turns the glue fusions off, `INKLING2_FUSE_STATS=1` logs which ones fire.

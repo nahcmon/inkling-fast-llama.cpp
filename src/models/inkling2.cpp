@@ -499,6 +499,11 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     // [TAG_BANDED_SMALL] a short single-sequence prompt batch (e.g. a chat follow-up) also takes the banded path:
     // the dense bias costs n_kv x n_tokens x n_head per layer, ~7 ms per token at 42k context
     static const int64_t n_banded_small_min = [] { const char * e = getenv("LLAMA_INKLING_BANDED_SMALL"); return e ? (int64_t) atoi(e) : (int64_t) 0; }();
+    static const bool implicit_mask_enabled = [] {
+        const char * env = getenv("LLAMA_FA_KV_CHUNK");
+        return !env || strcmp(env, "0") != 0;
+    }();
+    const bool implicit_mask = implicit_mask_enabled && cparams.causal_attn && hparams.swa_type == LLAMA_SWA_TYPE_STANDARD;
     inp->banded = cparams.flash_attn && (n_tokens > n_tokens_banded_min ||
         (n_banded_small_min > 0 && n_tokens >= n_banded_small_min && ubatch.n_seqs_unq == 1));
     for (int i = 0; i < 2 && inp->banded; ++i) {
@@ -511,9 +516,11 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             inp->swa_gather_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->n_kv_gather_swa);
             ggml_set_input(inp->swa_gather_idxs);
             ggml_set_name(inp->swa_gather_idxs, "attn_inp_swa_gather_idxs");
-            inp->swa_gather_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, inp->n_kv_gather_swa, n_tokens);
-            ggml_set_input(inp->swa_gather_mask);
-            ggml_set_name(inp->swa_gather_mask, "attn_inp_swa_gather_mask");
+            if (!implicit_mask) {
+                inp->swa_gather_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, inp->n_kv_gather_swa, n_tokens);
+                ggml_set_input(inp->swa_gather_mask);
+                ggml_set_name(inp->swa_gather_mask, "attn_inp_swa_gather_mask");
+            }
         }
     }
     // [TAG_BASE_GATHER] several sequences in a unified cache: gather this sequence's cells in position order
@@ -523,9 +530,11 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             inp->base_gather_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->n_kv_gather_base);
             ggml_set_input(inp->base_gather_idxs);
             ggml_set_name(inp->base_gather_idxs, "attn_inp_base_gather_idxs");
-            inp->base_gather_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, inp->n_kv_gather_base, n_tokens);
-            ggml_set_input(inp->base_gather_mask);
-            ggml_set_name(inp->base_gather_mask, "attn_inp_base_gather_mask");
+            if (!implicit_mask) {
+                inp->base_gather_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, inp->n_kv_gather_base, n_tokens);
+                ggml_set_input(inp->base_gather_mask);
+                ggml_set_name(inp->base_gather_mask, "attn_inp_base_gather_mask");
+            }
         }
     }
     const auto swa_gather = [&](bool swa) { return swa && inp->n_kv_banded[1] == 0 && inp->n_kv_gather_swa > 0; };
@@ -580,10 +589,13 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         // gathered K/V come out of get_rows as F32
         ggml_tensor * pk = ggml_new_tensor_4d(ctx0, gather ? GGML_TYPE_F32 : cache->type_k(), hd, pnq, nkv, 1);
         ggml_tensor * pv = ggml_new_tensor_4d(ctx0, gather ? GGML_TYPE_F32 : cache->type_v(), hd, pnq, nkv, 1);
-        ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, pnq, pnq, 1, 1);
+        ggml_tensor * pm = implicit_mask ? nullptr : ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, pnq, pnq, 1, 1);
         ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, pnq, 1);
         ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
         ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, pnq, 1));
+        if (implicit_mask) {
+            ggml_flash_attn_ext_banded_set_window(op, swa ? int32_t(hparams.n_swa) : -1);
+        }
         ggml_prec_set_acc(op, GGML_PREC_F32);
         const bool ok = ggml_backend_dev_supports_op(dev, op);
         banded_dev_ok.push_back({ { swa, dev }, ok });
@@ -789,8 +801,11 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                         ggml_tensor * g = ggml_get_rows(ctx0, rows, inp->swa_gather_idxs);
                         return ggml_permute(ctx0, ggml_reshape_4d(ctx0, g, all->ne[0], all->ne[1], n_kv_b, 1), 0, 2, 1, 3);
                     };
-                    k_fa = gathered(k_all);
-                    v_fa = gathered(v_all);
+                    ggml_tensor * kg = implicit_mask && k_all->type == GGML_TYPE_Q4_0 && v_all->type == GGML_TYPE_Q4_0 ?
+                        raw_gather(k_all, inp->swa_gather_idxs, n_kv_b) : nullptr;
+                    ggml_tensor * vg = kg ? raw_gather(v_all, inp->swa_gather_idxs, n_kv_b) : nullptr;
+                    k_fa = vg ? ggml_permute(ctx0, kg, 0, 2, 1, 3) : gathered(k_all);
+                    v_fa = vg ? ggml_permute(ctx0, vg, 0, 2, 1, 3) : gathered(v_all);
                     m    = inp->swa_gather_mask;
                 } else if (bgath) {
                     GGML_ASSERT(v_all->nb[1] < v_all->nb[2]);
@@ -811,21 +826,27 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     v_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_kv_b, v_all->ne[3],
                             v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
                 }
-                ggml_tensor *& mc = banded_mask[is_swa ? 1 : 0];
-                if (!mc || mc->ne[0] != n_kv_b) {
-                    ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
-                    // the whole mask needs no copy: at 256k context the copy was 128 MiB of compute buffer
-                    mc = mask->ne[0] == n_kv_b ? mask :
-                        ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
-                            mask->nb[1], mask->nb[2], mask->nb[3], 0));
+                m = nullptr;
+                if (!implicit_mask) {
+                    ggml_tensor *& mc = banded_mask[is_swa ? 1 : 0];
+                    if (!mc || mc->ne[0] != n_kv_b) {
+                        ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+                        // the whole mask needs no copy: at 256k context the copy was 128 MiB of compute buffer
+                        mc = mask->ne[0] == n_kv_b ? mask :
+                            ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
+                                mask->nb[1], mask->nb[2], mask->nb[3], 0));
+                    }
+                    m = mc;
                 }
-                m = mc;
                 }
                 // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
                 ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
                 rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
                 cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
                 ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
+                if (implicit_mask) {
+                    ggml_flash_attn_ext_banded_set_window(cur, is_swa ? int32_t(hparams.n_swa) : -1);
+                }
                 ggml_prec_set_acc(cur, GGML_PREC_F32);
                 res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
                 cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);

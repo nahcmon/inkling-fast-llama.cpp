@@ -3238,14 +3238,18 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_gather(uint32_t n_window) const {
 
 void llama_kv_cache_context::set_input_pos_gather(ggml_tensor * idxs, ggml_tensor * mask, const llama_ubatch * ubatch, uint32_t n_window) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(idxs->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
 
     const int64_t n   = idxs->ne[0];
     int32_t     * dst = (int32_t *) idxs->data;
-    ggml_fp16_t * m   = (ggml_fp16_t *) mask->data;
 
     const uint32_t got = kv->get_pos_gather(sinfos[i_cur], *ubatch, n_window, dst);
     GGML_ASSERT((int64_t) got == n);
+
+    if (!mask) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
+    ggml_fp16_t * m = (ggml_fp16_t *) mask->data;
 
     // key j holds position p_start + j, query i position p0 + i
     const int64_t p0      = ubatch->pos[0];

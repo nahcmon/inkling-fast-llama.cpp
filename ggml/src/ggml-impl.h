@@ -184,6 +184,7 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
 // - GGML_OP_FLASH_ATTN_EXT_BANDED
 //   0..2 - scale, max_bias, logit_softcap (f32)
 //   3    - acc
+//   4    - implicit window (banded only)
 static void ggml_set_op_params_i32(struct ggml_tensor * tensor, uint32_t i, int32_t value) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(int32_t));
     ((int32_t *)(tensor->op_params))[i] = value;

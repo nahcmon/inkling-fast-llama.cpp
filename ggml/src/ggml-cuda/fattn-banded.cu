@@ -595,6 +595,7 @@ static __global__ void flash_attn_ext_banded_mma(
         int64_t n_chunks,
         int64_t tiles_per_chunk,
         int64_t rel_extent,
+        int32_t window,
         int64_t mask_ne2,
         int64_t mask_ne3,
         uint64_t q_nb1,
@@ -635,19 +636,21 @@ static __global__ void flash_attn_ext_banded_mma(
     const int t    = lane % 4;
 
     const int64_t n_qt = (n_q + BQ - 1)/BQ;
+    const int64_t n_kt = (n_kv + BK - 1)/BK;
     const int64_t qt   = int64_t(blockIdx.x) / n_chunks;
     const int64_t ic   = int64_t(blockIdx.x) % n_chunks;
     const int64_t ih   = blockIdx.y;
     const int64_t ib   = blockIdx.z;
     const int64_t ih_kv = ih / (n_head_q / n_head_kv);
 
-    const int64_t n_kt     = (n_kv + BK - 1)/BK;
-    const int64_t kt_begin = ic*tiles_per_chunk;
-    const int64_t kt_end   = kt_begin + tiles_per_chunk < n_kt ? kt_begin + tiles_per_chunk : n_kt;
-
     const int64_t iq_w = qt*BQ + warp*16;
     const int64_t iq_r[2] = {iq_w + g, iq_w + g + 8};
     const int64_t q_offset = n_kv - n_q;
+    const int64_t q_first = qt*BQ + q_offset;
+    const int64_t first = window > 0 ? max(int64_t(0), q_first - window + 1) : 0;
+    const int64_t end = window != 0 ? min(n_kv, q_first + BQ) : n_kv;
+    const int64_t kt_begin = max(ic*tiles_per_chunk, first/BK);
+    const int64_t kt_end = min((ic + 1)*tiles_per_chunk, (end + BK - 1)/BK);
 
     const char * k_base = k + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
     const char * v_base = v + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3;
@@ -729,6 +732,7 @@ static __global__ void flash_attn_ext_banded_mma(
         const int64_t dist_hi = iq_w + 15 + q_offset - kv0;
         const int64_t dist_lo = iq_w + q_offset - (kv0 + BK - 1);
         const bool in_band = dist_hi >= 0 && dist_lo < rel_extent;
+        const bool check_window = window != 0 && (dist_lo < 0 || (window > 0 && dist_hi >= window));
 
 #pragma unroll
         for (int j = 0; j < BK/8; ++j) {
@@ -736,15 +740,13 @@ static __global__ void flash_attn_ext_banded_mma(
             for (int e = 0; e < 4; ++e) {
                 const int     r  = e / 2;
                 const int64_t ik = kv0 + j*8 + 2*t + (e % 2);
+                const int64_t dist = iq_r[r] + q_offset - ik;
                 float s = S[j][e]*scale;
-                if (ik >= n_kv) {
+                if (ik >= n_kv || (check_window && (dist < 0 || (window > 0 && dist >= window)))) {
                     s = -INFINITY;
                 } else if (iq_r[r] < n_q) {
-                    if (in_band) {
-                        const int64_t dist = iq_r[r] + q_offset - ik;
-                        if (dist >= 0 && dist < rel_extent) {
-                            s += fattn_banded_load(r_base + uint64_t(dist)*r_nb0 + uint64_t(iq_r[r])*r_nb2, type_rel);
-                        }
+                    if (in_band && dist >= 0 && dist < rel_extent) {
+                        s += fattn_banded_load(r_base + uint64_t(dist)*r_nb0 + uint64_t(iq_r[r])*r_nb2, type_rel);
                     }
                     if (flag == 2) {
                         s += __half2float(*(const half *) (m_base + uint64_t(iq_r[r])*m_nb1 + uint64_t(ik)*sizeof(half)));
@@ -933,6 +935,9 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float))) {
         return false;
     }
+    if (ggml_get_op_params_i32(dst, 4) != 0 && (!sinks || !fattn_banded_mma_usable(device, dst))) {
+        return false;
+    }
     return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&
         q->ne[2] % m->ne[2] == 0 && q->ne[3] % m->ne[3] == 0);
 #endif
@@ -1093,7 +1098,7 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     flash_attn_ext_banded_mma<DD, NW, T><<<blocks, NW*WARP_SIZE, 0, stream>>>( \
         (const char *) q->data, k_data, v_data, m ? (const char *) m->data : nullptr, m ? flags.get() : nullptr, \
         (const char *) rel->data, n_chunks == 1 ? sinks_d : nullptr, (float *) dst->data, part.get(), \
-        scale, rel->type, n_q, n_kv, q->ne[2], k->ne[2], n_chunks, tiles_per_chunk, rel_extent, \
+        scale, rel->type, n_q, n_kv, q->ne[2], k->ne[2], n_chunks, tiles_per_chunk, rel_extent, ggml_get_op_params_i32(dst, 4), \
         m ? m->ne[2] : 1, m ? m->ne[3] : 1, q->nb[1], q->nb[2], q->nb[3], \
         k_nb[1], k_nb[2], k_nb[3], v_nb[1], v_nb[2], v_nb[3], \
         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \

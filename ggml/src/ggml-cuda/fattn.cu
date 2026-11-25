@@ -598,7 +598,7 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
     }
 
     // the MMA kernel passes rel in the sinks slot
-    if (dst->src[4]) {
+    if (dst->src[4] || ggml_get_op_params_i32(dst, 4) != 0) {
         return false;
     }
 
@@ -763,9 +763,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
-                    // [TAG_FA_VEC_QKV] the MMA kernel needs an f16 copy of the whole quantized K/V: at 128k context that
-                    // is 512 MiB for one layer, enough to push a 12 GB card into shared memory. The vector kernel reads
-                    // q4_0/q8_0 directly, so parallel decode (one token per chat, up to 8 chats) stays on it.
+                    // [TAG_FA_VEC_QKV] Keep parallel decode on the quantized vector kernel.
                     if (Q->ne[1] <= 8) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
@@ -855,9 +853,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            need_f16_K = need_f16_V = !ggml_cuda_fattn_mma_direct_kv(ggml_cuda_info().devices[device].cc, dst);
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
