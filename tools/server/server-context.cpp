@@ -930,11 +930,13 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    const int64_t t_start = ggml_time_us();
     res = mtmd_batch_encode(mbatch.get());
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
     }
+    SLT_TRC(slot, "encoded mtmd batch in %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
 
     return 0;
 }

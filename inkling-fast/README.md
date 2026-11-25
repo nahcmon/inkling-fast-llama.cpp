@@ -160,19 +160,19 @@ Standard and Fast use Inkling-2-Mini-fast-9.3-tuned.gguf. Long uses Inkling-2-Mi
 .\inkling-fast\stop-inkling.ps1
 ~~~
 
-The launcher offers three modes. Decode numbers cover the first reply and a follow-up at about 9k tokens.
-Prompt throughput is from the paste turn in the two-image chat. Top-1 measures agreement with the Q8 reference.
-All three modes use a 512-token microbatch and q4_0 K/V.
+The launcher offers three modes. The image rates include vision encoding and prompt processing.
+Decode rates cover the first reply and a follow-up at about 9k tokens. Top-1 measures agreement with the Q8 reference.
+All three modes use a 512-token microbatch and a 1,024-token image limit by default.
 
-| Mode | Context | Writes (tok/s) | Reads prompts (tok/s) | Top-1 |
-| --- | ---: | ---: | ---: | ---: |
-| Standard (default) | 128k | 84 -> 74 | ~1842 | 92.8% |
-| Fast | 64k | 84 -> 74 | ~1827 | 92.8% |
-| Long | 256k | 85 -> 75 | ~1757 | 92.4% |
+| Mode | Context | Slots | Global / SWA KV | Photo / screenshot / paste (tok/s) | Decode first / follow-up (tok/s) | Top-1 |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| Standard | 128k | 8 | q4_0 / q4_0 | 953 / 1173 / 1818 | 83.6 / 73.9 | 92.8% |
+| Fast | 64k | 8 | q4_0 / q4_0 | 944 / 1071 / 1789 | 83.7 / 73.9 | 92.8% |
+| Long | 256k | 4 | q3_0 / q4_0 | 917 / 990 / 1603 | 81.6 / 70.2 | 92.0% |
 
-Use -Mode Standard, -Mode Fast, or -Mode Long to skip the menu. The server defaults to vision, eight parallel
-requests, and the inkling-2-mini API alias. Other options include -Parallel, -Ctx, -NoVision, -Foreground,
--Port, -LocalOnly, -CacheRam, and -Engine.
+Use `-Mode Standard`, `-Mode Fast`, or `-Mode Long` to skip the menu. The server defaults to vision and the
+`inkling-2-mini` API alias. Long uses four slots to leave VRAM for vision at 256k. `-Parallel` overrides the
+slot count. Other options include `-Ctx`, `-NoVision`, `-Foreground`, `-Port`, `-LocalOnly`, `-CacheRam`, and `-Engine`.
 
 Prefill uses implicit causal bounds for contiguous or position-ordered K/V and dequantizes q3_0/q4_0 tiles in shared memory.
 Set `LLAMA_FA_KV_CHUNK=0` to compare against the dense-mask and staged-conversion paths.
