@@ -15,6 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from vspeed_long import HERE, HTTP, gpu_lock, request, wait_until_ready, memory_sample  # noqa: E402
 from PIL import Image  # noqa: E402
 
+GREETING = [{"type": "text", "text": "Hi! What can you help me with? Answer in a few sentences."}]
+
 
 def photo(w, h, seed):
     # photo-like content (smooth gradients + noise); the vision cost depends on the size, not the content
@@ -95,6 +97,14 @@ def probe_turns(url, paste, slots):
         ], 12, {"id_slot": i % slots}
 
 
+def greeting_turns(slots):
+    for i, slot in enumerate((0, 0, 0, 1, 2, 0), start=1):
+        slot %= slots
+        yield f"greeting {i} slot {slot}", [{"role": "user", "content": GREETING}], 200, {
+            "id_slot": slot, "cache_prompt": False,
+        }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("name")
@@ -110,7 +120,9 @@ def main():
     ap.add_argument("--extra", default="", help="extra server args, space separated")
     ap.add_argument("--port", type=int, default=8098)
     ap.add_argument("--timeout", type=float, default=165, help="wall-clock limit in seconds after GPU lock acquisition")
-    ap.add_argument("--ttft-probe", action="store_true", help="run short follow-up and shared system prompt probes instead")
+    probes = ap.add_mutually_exclusive_group()
+    probes.add_argument("--ttft-probe", action="store_true", help="run short follow-up and shared system prompt probes instead")
+    probes.add_argument("--greeting-probe", action="store_true", help="repeat a fresh greeting with the prompt cache disabled")
     ap.add_argument("--cpu-sampler", action="store_true", help="disable per-request GPU sampling for profiling")
     ap.add_argument("--probe-effort", choices=["none"], help="explicitly request minimal reasoning in the TTFT probe")
     ap.add_argument("--launcher", default="",
@@ -139,8 +151,9 @@ def main():
     cmd += a.extra.split()
 
     paste = Path(a.paste or ROOT / "cmp" / "eval.txt").read_text(encoding="utf-8")[:22000]
-    turns = [] if a.ttft_probe else [
-        ("hi", [{"type": "text", "text": "Hi! What can you help me with? Answer in a few sentences."}], 200),
+    probe = a.ttft_probe or a.greeting_probe
+    turns = [] if probe else [
+        ("hi", GREETING, 200),
         ("photo 4032x3024", [{"type": "image_url", "image_url": {"url": photo(4032, 3024, 1)}},
                              {"type": "text", "text": "Describe this photo in detail."}], 300),
         ("screenshot 2560x1440", [{"type": "image_url", "image_url": {"url": photo(2560, 1440, 2)}},
@@ -184,8 +197,11 @@ def main():
             m = memory_sample("loaded", proc.pid)
             rows.append(("loaded", 0, {}, m, {"used": m["used_mib"], "srv": m["server_shared_mib"]}, {}))
             msgs = []
-            requests = (probe_turns(url, paste, request(url, "/props")["total_slots"]) if a.ttft_probe else
-                        ((label, [{"role": "user", "content": content}], n, {}) for label, content, n in turns))
+            if probe:
+                slots = request(url, "/props")["total_slots"]
+                requests = greeting_turns(slots) if a.greeting_probe else probe_turns(url, paste, slots)
+            else:
+                requests = ((label, [{"role": "user", "content": content}], n, {}) for label, content, n in turns)
             for label, messages, n, options in requests:
                 if "id_slot" in options:
                     msgs = []
@@ -202,7 +218,7 @@ def main():
                         except Exception:
                             pass
                         stop.wait(1.0)
-                if not a.ttft_probe:
+                if not probe:
                     t = threading.Thread(target=watch, daemon=True)
                     t.start()
                 try:
@@ -212,11 +228,11 @@ def main():
                         options["chat_template_kwargs"] = {"reasoning_effort": a.probe_effort}
                     r = stream_chat(url, msgs, n, deadline, **options)
                 finally:
-                    if not a.ttft_probe:
+                    if not probe:
                         stop.set()
                         t.join()
                 msgs.append({"role": "assistant", "content": r["content"]})
-                if not a.ttft_probe:
+                if not probe:
                     m = memory_sample(label, proc.pid)
                     peak["used"] = max(peak["used"], m["used_mib"])
                     peak["srv"] = max(peak["srv"], m["server_shared_mib"])
@@ -245,7 +261,7 @@ def main():
         pn = tm.get("prompt_n", 0)
         pps = tm.get("prompt_per_second", 0)
         tps = tm.get("predicted_per_second", 0)
-        if a.ttft_probe and label != "loaded":
+        if probe and label != "loaded":
             memory = f"{'-':>6} {'-':>6} {'-':>9} {'-':>9} {'-':>9}"
         else:
             memory = (f"{m['used_mib']:>6} {peak['used']:>6} {m['server_shared_mib']:>9.0f} "
