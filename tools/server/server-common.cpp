@@ -1638,12 +1638,16 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
+    // an explicit "off" from the request: enable_thinking=false or reasoning_effort "none"
+    bool reasoning_off_requested = enable_thinking_kwarg == "false";
+
     // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
     if (body.contains("reasoning_effort")) {
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
             inputs.chat_template_kwargs.erase("reasoning_effort");
+            reasoning_off_requested = true;
         } else if (!reasoning_effort.empty()) {
             const auto rejected = caps.at("reasoning_effort_rejected").get<std::vector<std::string>>();
             if (std::find(rejected.begin(), rejected.end(), reasoning_effort) != rejected.end()) {
@@ -1652,6 +1656,13 @@ json oaicompat_chat_params_parse(
             }
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
+    }
+
+    // a template that turns reasoning off only through its effort level (Inkling: "none" = effort 0, no enable_thinking)
+    // gets "none" for an explicit off; otherwise it would fall back to its default effort and keep reasoning
+    if (reasoning_off_requested && json_value(caps, "supports_reasoning_effort_none", false) &&
+        inputs.chat_template_kwargs.count("reasoning_effort") == 0) {
+        inputs.chat_template_kwargs["reasoning_effort"] = json("none").dump();
     }
 
     inputs.force_pure_content = opt.force_pure_content;

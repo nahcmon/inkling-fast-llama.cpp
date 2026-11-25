@@ -115,6 +115,7 @@ std::map<std::string, bool> caps::to_map() const {
         {"supports_system_role", supports_system_role},
         {"supports_preserve_reasoning", supports_preserve_reasoning},
         {"supports_reasoning_effort", supports_reasoning_effort},
+        {"supports_reasoning_effort_none", supports_reasoning_effort_none},
         {"supports_object_arguments", supports_object_arguments},
     };
 }
@@ -650,6 +651,11 @@ caps caps_get(jinja::program & prog) {
         if (!result.reasoning_effort_levels.empty()) {
             result.reasoning_effort_rejected = rejected;
         }
+
+        // templates like Inkling map "none" to effort 0 and ignore enable_thinking; "none" is probed apart from the
+        // levels so it never shows up as a level
+        const auto none = render("none");
+        result.supports_reasoning_effort_none = none.has_value() && none != unknown;
     }
 
     JJ_DEBUG("%s\n", result.to_string().c_str());
