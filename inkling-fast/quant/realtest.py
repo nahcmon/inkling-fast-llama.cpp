@@ -1,16 +1,18 @@
 """Realistic serving test: the launcher's exact server settings, then a chat the way a user has one
-(short turns, two photos, a long paste), measuring decode tok/s and VRAM/shared memory after every turn.
+(short turns, two photos, a long paste), measuring TTFT, decode tok/s and VRAM/shared memory.
 
   python realtest.py NAME --exe ENGINE --model GGUF --ctx 131072 [--kv-global q3_0]
 
 The prefill release gate is paste prefill >= 1500 tok/s, follow-up decode >= 56 tok/s,
 and peak server shared memory <= 64 MiB above the loaded sample.
 """
-import argparse, base64, io, json, os, random, subprocess, sys, threading, time
+import argparse, base64, io, json, os, random, signal, subprocess, sys, threading, time
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from vspeed_long import HERE, gpu_lock, request, wait_until_ready, memory_sample  # noqa: E402
+from vspeed_long import HERE, HTTP, gpu_lock, request, wait_until_ready, memory_sample  # noqa: E402
 from PIL import Image  # noqa: E402
 
 
@@ -25,8 +27,75 @@ def photo(w, h, seed):
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def stream_chat(url, messages, max_tokens, deadline, **options):
+    payload = {"messages": messages, "max_tokens": max_tokens, "ignore_eos": True,
+               "temperature": 1.0, "seed": 42, **options,
+               "stream": True, "stream_options": {"include_usage": True}}
+    req = Request(url + "/v1/chat/completions", json.dumps(payload).encode("utf-8"),
+                  {"Content-Type": "application/json", "Accept": "text/event-stream"})
+    parts = {"content": [], "reasoning_content": []}
+    first_ms = dict.fromkeys(parts)
+    usage = timings = None
+    done = False
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("realtest wall-clock limit reached")
+    start = time.perf_counter()
+    try:
+        with HTTP.open(req, timeout=remaining) as response:
+            for line in response:
+                received = time.perf_counter()
+                if received - start >= remaining:
+                    raise TimeoutError("realtest wall-clock limit reached")
+                if not line.startswith(b"data:"):
+                    continue
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    done = True
+                    break
+                chunk = json.loads(data)
+                if "error" in chunk:
+                    raise RuntimeError(f"chat stream failed: {chunk['error']}")
+                usage = chunk.get("usage") or usage
+                timings = chunk.get("timings") or timings
+                for choice in chunk.get("choices", []):
+                    delta = choice.get("delta", {})
+                    for key in parts:
+                        value = delta.get(key)
+                        if value:
+                            if first_ms[key] is None:
+                                first_ms[key] = (received - start) * 1000
+                            parts[key].append(value)
+    except HTTPError as exc:
+        raise RuntimeError(f"chat completion: HTTP {exc.code}: {exc.read().decode()}") from exc
+    if not done or usage is None or timings is None:
+        raise RuntimeError("chat stream ended without completion, usage, or server timings")
+    return {"content": "".join(parts["content"]), "first_ms": first_ms,
+            "usage": usage, "timings": timings}
+
+
+def probe_turns(url, paste, slots):
+    yield "probe hi", [{"role": "user", "content": "Hi! What can you help me with? Answer in a few sentences."}], 32, {}
+    for i in range(10):
+        yield f"short follow-up {i + 1:02}", [{"role": "user", "content": "What else?"}], 12, {}
+    # Use the tokenizer to size the shared system text, then send it through chat templating.
+    if not paste.strip():
+        raise ValueError("TTFT probes require a nonempty paste file")
+    text = paste
+    while True:
+        ids = request(url, "/tokenize", {"content": text, "add_special": False})["tokens"]
+        if len(ids) >= 2048:
+            break
+        text += "\n" + paste
+    system = request(url, "/detokenize", {"tokens": ids[:2048]})["content"]
+    for i in range(5):
+        yield f"shared system {i + 1}", [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Give me one fact from section {i + 1}."},
+        ], 12, {"id_slot": i % slots}
+
+
 def main():
-    global ROOT
     ap = argparse.ArgumentParser()
     ap.add_argument("name")
     ap.add_argument("--model-dir", default=str(HERE.parent),
@@ -41,6 +110,9 @@ def main():
     ap.add_argument("--extra", default="", help="extra server args, space separated")
     ap.add_argument("--port", type=int, default=8098)
     ap.add_argument("--timeout", type=float, default=165, help="wall-clock limit in seconds after GPU lock acquisition")
+    ap.add_argument("--ttft-probe", action="store_true", help="run short follow-up and shared system prompt probes instead")
+    ap.add_argument("--cpu-sampler", action="store_true", help="disable per-request GPU sampling for profiling")
+    ap.add_argument("--probe-effort", choices=["none"], help="explicitly request minimal reasoning in the TTFT probe")
     ap.add_argument("--launcher", default="",
                     help='start the server with ../run-inkling.ps1 and these args instead (e.g. "-Mode Standard"); '
                          'it is stopped with stop-inkling.ps1 afterwards')
@@ -67,7 +139,7 @@ def main():
     cmd += a.extra.split()
 
     paste = Path(a.paste or ROOT / "cmp" / "eval.txt").read_text(encoding="utf-8")[:22000]
-    turns = [
+    turns = [] if a.ttft_probe else [
         ("hi", [{"type": "text", "text": "Hi! What can you help me with? Answer in a few sentences."}], 200),
         ("photo 4032x3024", [{"type": "image_url", "image_url": {"url": photo(4032, 3024, 1)}},
                              {"type": "text", "text": "Describe this photo in detail."}], 300),
@@ -78,8 +150,10 @@ def main():
     ]
 
     log_path = HERE / f"realtest_{a.name}.log"
+    lock_dir = ROOT / "shrink"
+    lock_path = (lock_dir if lock_dir.is_dir() else HERE) / "gpu.lock"
     rows = []
-    with gpu_lock(), open(log_path, "w", encoding="utf-8") as log:
+    with gpu_lock(lock_path), open(log_path, "w", encoding="utf-8") as log:
         deadline = time.monotonic() + a.timeout
         if a.launcher:  # test exactly what the user runs: the deployed launcher script
             ps = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
@@ -92,19 +166,30 @@ def main():
             class Launched:
                 pid = int((ROOT / "inkling-server.pid").read_text().strip())
                 def poll(self): return None
+                def terminate(self):
+                    try:
+                        os.kill(self.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                 def kill(self): subprocess.run(ps + [str(ROOT / "stop-inkling.ps1")], stdin=subprocess.DEVNULL)
                 def wait(self): pass
             proc = Launched()
         else:
             proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        watchdog = threading.Timer(max(0, deadline - time.monotonic()), proc.terminate)
+        watchdog.start()
         try:
             wait_until_ready(proc, url)
             time.sleep(2)
             m = memory_sample("loaded", proc.pid)
-            rows.append(("loaded", 0, 0, None, None, m))
+            rows.append(("loaded", 0, {}, m, {"used": m["used_mib"], "srv": m["server_shared_mib"]}, {}))
             msgs = []
-            for label, content, n in turns:
-                msgs.append({"role": "user", "content": content})
+            requests = (probe_turns(url, paste, request(url, "/props")["total_slots"]) if a.ttft_probe else
+                        ((label, [{"role": "user", "content": content}], n, {}) for label, content, n in turns))
+            for label, messages, n, options in requests:
+                if "id_slot" in options:
+                    msgs = []
+                msgs.extend(messages)
                 peak = {"used": 0, "srv": 0.0}
                 stop = threading.Event()
 
@@ -117,26 +202,29 @@ def main():
                         except Exception:
                             pass
                         stop.wait(1.0)
-                t = threading.Thread(target=watch, daemon=True)
-                t.start()
+                if not a.ttft_probe:
+                    t = threading.Thread(target=watch, daemon=True)
+                    t.start()
                 try:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError("realtest wall-clock limit reached")
-                    r = request(url, "/v1/chat/completions", {"messages": msgs, "max_tokens": n, "ignore_eos": True,
-                                                            "temperature": 1.0}, timeout=remaining)
+                    if a.cpu_sampler:
+                        options["backend_sampling"] = False
+                    if a.ttft_probe and a.probe_effort:
+                        options["chat_template_kwargs"] = {"reasoning_effort": a.probe_effort}
+                    r = stream_chat(url, msgs, n, deadline, **options)
                 finally:
-                    stop.set()
-                    t.join()
-                tm = r.get("timings", {})
-                msgs.append({"role": "assistant", "content": r["choices"][0]["message"]["content"]})
-                m = memory_sample(label, proc.pid)
-                peak["used"] = max(peak["used"], m["used_mib"])
-                peak["srv"] = max(peak["srv"], m["server_shared_mib"])
+                    if not a.ttft_probe:
+                        stop.set()
+                        t.join()
+                msgs.append({"role": "assistant", "content": r["content"]})
+                if not a.ttft_probe:
+                    m = memory_sample(label, proc.pid)
+                    peak["used"] = max(peak["used"], m["used_mib"])
+                    peak["srv"] = max(peak["srv"], m["server_shared_mib"])
                 ctx_used = r["usage"]["prompt_tokens"] + r["usage"]["completion_tokens"]
-                rows.append((label, ctx_used, tm.get("prompt_n"), tm.get("prompt_per_second"),
-                             tm.get("predicted_per_second"), m, peak))
+                rows.append((label, ctx_used, r["timings"], m, peak, r["first_ms"]))
         finally:
+            watchdog.cancel()
+            watchdog.join()
             proc.kill(); proc.wait()
 
     if a.launcher:
@@ -144,13 +232,26 @@ def main():
     else:
         description = (f"{Path(a.model).name} ctx {a.ctx} kv_global={a.kv_global or 'q4_0'} "
                        f"np {a.np} ub {a.ub} {a.extra}")
+    if a.probe_effort:
+        description += f" | probe reasoning effort: {a.probe_effort}"
     out = [f"# {a.name}: {description}",
-           f"{'turn':22} {'ctx':>6} {'new':>6} {'pp t/s':>7} {'tg t/s':>7} {'used':>6} {'peak':>6} {'srvShared':>9} {'peakSrvSh':>9} {'allShared':>9}"]
-    for row in rows:
-        label, ctx_used, pn, pps, tps, m = row[:6]
-        peak = row[6] if len(row) > 6 else {"used": m["used_mib"], "srv": m["server_shared_mib"]}
-        out.append(f"{label:22} {ctx_used:>6} {pn or 0:>6} {pps or 0:>7.0f} {tps or 0:>7.1f} {m['used_mib']:>6} "
-                   f"{peak['used']:>6} {m['server_shared_mib']:>9.0f} {peak['srv']:>9.0f} {m['shared_mib']:>9.0f}")
+           f"{'turn':22} {'ctx':>6} {'new':>6} {'pp t/s':>7} {'tg t/s':>7} {'used':>6} {'peak':>6} {'srvShared':>9} "
+           f"{'peakSrvSh':>9} {'allShared':>9} {'TTFT ms':>9} {'reason ms':>9} {'prompt ms':>9}"]
+
+    def fmt_ms(value):
+        return f"{value:9.1f}" if value is not None else f"{'-':>9}"
+
+    for label, ctx_used, tm, m, peak, first_ms in rows:
+        pn = tm.get("prompt_n", 0)
+        pps = tm.get("prompt_per_second", 0)
+        tps = tm.get("predicted_per_second", 0)
+        if a.ttft_probe and label != "loaded":
+            memory = f"{'-':>6} {'-':>6} {'-':>9} {'-':>9} {'-':>9}"
+        else:
+            memory = (f"{m['used_mib']:>6} {peak['used']:>6} {m['server_shared_mib']:>9.0f} "
+                      f"{peak['srv']:>9.0f} {m['shared_mib']:>9.0f}")
+        out.append(f"{label:22} {ctx_used:>6} {pn or 0:>6} {pps or 0:>7.0f} {tps or 0:>7.1f} {memory} "
+                   f"{fmt_ms(first_ms.get('content'))} {fmt_ms(first_ms.get('reasoning_content'))} {fmt_ms(tm.get('prompt_ms'))}")
     text = "\n".join(out)
     print(text)
     with open(HERE / "realtest.tsv", "a", encoding="utf-8") as f:

@@ -1543,6 +1543,30 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             std::vector<float> zeros;
             common_batch_set_zero_state(batch, model, zeros);
             llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+
+            char arch[16];
+            if (params.sampling.backend_sampling && params.n_gpu_layers > 0 &&
+                    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) > 0 &&
+                    strcmp(arch, "inkling2") == 0) {
+                // Load the small prompt kernel variants while the server is starting.
+                const auto warm_tokens = common_tokenize(vocab,
+                        "Explain how to pack for a weekend train trip. Include a plan for the first day, "
+                        "the weather forecast, things to bring, and three practical ways to keep the journey comfortable. "
+                        "Suggest two places to stop for lunch and give an example of a simple itinerary.",
+                        true, false);
+                for (const int n_tokens : {10, 21, 30, 40}) {
+                    if (n_tokens > llama_n_ubatch(lctx) || n_tokens > (int) warm_tokens.size()) {
+                        break;
+                    }
+                    llama_synchronize(lctx);
+                    llama_memory_clear(llama_get_memory(lctx), false);
+                    common_batch warm_batch = common_batch_get_one(lctx, warm_tokens.data(), n_tokens);
+                    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, warm_batch.get()) != 0) {
+                        COM_WRN("%s: short-prompt warmup stopped at %d tokens\n", __func__, n_tokens);
+                        break;
+                    }
+                }
+            }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);

@@ -4780,6 +4780,21 @@ private:
                     static const bool ckpt_end = [] { const char * e = getenv("LLAMA_SERVER_CKPT_END"); return !e || atoi(e) != 0; }(); // default on, =0 disables
                     const bool do_checkpoint_any = do_checkpoint;
 
+                    // Keep a forkable snapshot before the first user message of a long system prompt.
+                    int32_t system_prefix_end = -1;
+                    if (do_checkpoint && ckpt_end && params_base.n_ctx_checkpoints >= 2 && params_base.kv_unified &&
+                            slots.size() > 1 && kv_fork_min() > 0 && kv_fork_plain(slot) && !ctx_dft && !input_tokens.has_media() &&
+                            slot.task->params.cache_prompt && !slot.task->is_stateless() && !spans.spans.empty() &&
+                            spans.spans.front().role == COMMON_CHAT_ROLE_SYSTEM) {
+                        const auto first_non_system = std::find_if(spans.spans.begin(), spans.spans.end(), [](const auto & span) {
+                            return span.role != COMMON_CHAT_ROLE_SYSTEM;
+                        });
+                        if (first_non_system != spans.spans.end() && first_non_system->role == COMMON_CHAT_ROLE_USER &&
+                                first_non_system->pos >= (size_t) kv_fork_min()) {
+                            system_prefix_end = (int32_t) first_non_system->pos;
+                        }
+                    }
+
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
@@ -4828,6 +4843,10 @@ private:
                             batch.set_decision_group(batch.size() - 1, slot.task->decision.group[slot.prompt.n_tokens()]);
                         }
                         slot.prompt.tokens.push_back(cur_tok);
+
+                        if (slot.prompt.n_tokens() == system_prefix_end) {
+                            break;
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -4908,6 +4927,9 @@ private:
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
+                    const bool checkpoint_system_prefix = n_tokens_start == system_prefix_end &&
+                        n_tokens_start > slot.stats.n_prompt_cached && pos_max == n_tokens_start - 1;
+
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
                     if (do_checkpoint && pos_min < 0) {
@@ -4932,7 +4954,7 @@ private:
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
-                    if (do_checkpoint) {
+                    if (do_checkpoint || checkpoint_system_prefix) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
                 }
@@ -5722,6 +5744,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
 
         const int64_t t_tok1 = ggml_time_us();
+        const size_t n_prompt_tokens = inputs.empty() ? 0 : inputs.front().size();
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
         for (size_t i = 0; i < inputs.size(); i++) {
@@ -5761,7 +5784,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         rd.post_tasks(std::move(tasks), chat_session);
         if (req_timing) {
             SRV_WRN("req_timing: tokenize %.2f ms (%zu tokens) | tasks %.2f ms | post %.2f ms\n", (t_tok1 - t_tok0)/1000.0,
-                inputs.empty() ? (size_t) 0 : inputs[0].size(), (t_tok2 - t_tok1)/1000.0, (ggml_time_us() - t_tok2)/1000.0);
+                n_prompt_tokens, (t_tok2 - t_tok1)/1000.0, (ggml_time_us() - t_tok2)/1000.0);
         }
     } catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));

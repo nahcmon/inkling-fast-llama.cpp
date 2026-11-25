@@ -1749,6 +1749,17 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         sampler->iface->backend_apply &&
         llama_sampler_chain_n(sampler) > 0;
 
+    const auto update_sampler_graph = [&] {
+        // Inkling's existing scheduler can allocate the next graph within its reserved node capacity.
+        // Invalidate the graph even if a new sampler is allocated at the old address.
+        if (model.arch == LLM_ARCH_INKLING2 && sched && !cparams.pipeline_parallel &&
+                graph_max_nodes() <= sched_params_cur.max_nodes) {
+            gf_res_prev_active = nullptr;
+        } else {
+            sched_need_reserve = true;
+        }
+    };
+
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
@@ -1756,7 +1767,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        update_sampler_graph();
 
         return true;
     }
@@ -1764,18 +1775,16 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && !can_offload) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+        if (sampling.samplers.erase(seq_id) > 0) {
+            update_sampler_graph();
         }
-
-        sampling.samplers.erase(seq_id);
 
         return false;
     }
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    update_sampler_graph();
 
     return true;
 }

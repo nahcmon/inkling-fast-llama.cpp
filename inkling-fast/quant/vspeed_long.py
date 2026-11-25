@@ -21,20 +21,20 @@ HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 @contextmanager
-def gpu_lock():
+def gpu_lock(lock_path=LOCK):
     while True:
         try:
-            lock = LOCK.open("x")
+            lock = lock_path.open("x")
             break
         except FileExistsError:
-            print(f"Waiting for {LOCK}", flush=True)
+            print(f"Waiting for {lock_path}", flush=True)
             time.sleep(10)
     try:
         with lock:
             print(os.getpid(), file=lock)
         yield
     finally:
-        LOCK.unlink()
+        lock_path.unlink()
 
 
 def request(url, route, payload=None, timeout=10):
