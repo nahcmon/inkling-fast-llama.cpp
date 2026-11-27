@@ -5,10 +5,14 @@ fully on one 12 GB NVIDIA GPU: 128k context, image input, and 8 requests at once
 from one shared KV cache. The model files are on Hugging Face:
 [nahcmon/Inkling-2-Mini-fast-GGUF](https://huggingface.co/nahcmon/Inkling-2-Mini-fast-GGUF).
 
-## Default setup: 128k context, vision, 8 requests at once
+Current files: `Inkling-2-Mini-fast-9.3-tuned.gguf` (9.24 GB, Standard/Fast modes, mean KLD 0.0391 vs the Q8
+reference, kld.py) and `Inkling-2-Mini-fast-long.gguf` (8.95 GB, Long mode, KLD 0.0438). Per-mode speeds are in
+[Run](#run) below.
 
-`Inkling-2-Mini-fast-small.gguf` (9.5 GB) + `mmproj-Inkling-2-Mini-Q8_0.gguf`, 128k shared context, q4_0 KV,
-`-np 8 -kvu -ub 256`. VRAM 11.4 GB with vision loaded. End-to-end HTTP benchmark (256 tokens per
+## Previous release: 128k context, vision, 8 requests at once
+
+`Inkling-2-Mini-fast-small.gguf` (9.5 GB, since replaced by 9.3-tuned) + `mmproj-Inkling-2-Mini-Q8_0.gguf`, 128k
+shared context, q4_0 KV, `-np 8 -kvu -ub 256`. VRAM 11.4 GB with vision loaded. End-to-end HTTP benchmark (256 tokens per
 request, all requests started together, temperature 1.0, mean of 2 rounds):
 
 | requests at once | tok/s each request sees | total tok/s |
@@ -134,8 +138,8 @@ RAM. Most of the gain comes from making it fit; the rest from cutting the number
 18. **GPTQ-style quantizer** (`inkling-fast/quant/`): expert gate/up bits are placed per layer group by measured
    sensitivity, and each 256-column block's quantization error is compensated in the columns not yet quantized,
    using the layer's input covariance recorded by `llama-imatrix` (`IMAT_COV_DIR`). Same 9.24 GB, mean KLD
-   0.0491 to 0.0428 (kld.py), same speed. `run-inkling.ps1` uses `Inkling-2-Mini-fast-9.2-gptq.gguf` with a 160k
-   context when it is present. Details and rejected variants in `quant/README.md`.
+   0.0491 to 0.0428 (kld.py), same speed. Round 2 (`Inkling-2-Mini-fast-9.3-tuned.gguf`, the current default) adds
+   learned per-layer block scales and a larger calibration set: 0.0391. Details and rejected variants in `quant/README.md`.
 
 Every engine change was checked against reference logits (KLD, top-1 agreement); none of them changed the output
 beyond float rounding.
