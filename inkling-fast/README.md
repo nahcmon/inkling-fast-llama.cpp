@@ -5,9 +5,10 @@ fully on one 12 GB NVIDIA GPU: 128k context, image input, and 8 requests at once
 from one shared KV cache. The model files are on Hugging Face:
 [nahcmon/Inkling-2-Mini-fast-GGUF](https://huggingface.co/nahcmon/Inkling-2-Mini-fast-GGUF).
 
-Current files: `Inkling-2-Mini-fast-9.3-tuned.gguf` (9.24 GB, Standard/Fast modes, mean KLD 0.0391 vs the Q8
-reference, kld.py) and `Inkling-2-Mini-fast-long.gguf` (8.95 GB, Long mode, KLD 0.0438). Per-mode speeds are in
-[Run](#run) below.
+Current file: `Inkling-2-Mini-Uncensored-fast.gguf` (9.24 GB), a quant of
+[AtomicChat's uncensored fine-tune](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF) with the same
+recipe: mean KLD 0.0376 vs its Q8 reference (kld.py), same speed as the previous `fast-9.3-tuned`. It answers many
+requests the original refuses; you are responsible for how you use it. Speeds are in [Run](#run) below.
 
 ## Previous release: 128k context, vision, 8 requests at once
 
@@ -138,8 +139,13 @@ RAM. Most of the gain comes from making it fit; the rest from cutting the number
 18. **GPTQ-style quantizer** (`inkling-fast/quant/`): expert gate/up bits are placed per layer group by measured
    sensitivity, and each 256-column block's quantization error is compensated in the columns not yet quantized,
    using the layer's input covariance recorded by `llama-imatrix` (`IMAT_COV_DIR`). Same 9.24 GB, mean KLD
-   0.0491 to 0.0428 (kld.py), same speed. Round 2 (`Inkling-2-Mini-fast-9.3-tuned.gguf`, the current default) adds
-   learned per-layer block scales and a larger calibration set: 0.0391. Details and rejected variants in `quant/README.md`.
+   0.0491 to 0.0428 (kld.py), same speed. Round 2 (`Inkling-2-Mini-fast-9.3-tuned.gguf`) adds learned per-layer
+   block scales and a larger calibration set: 0.0391. Details and rejected variants in `quant/README.md`.
+19. **Uncensored build** (`Inkling-2-Mini-Uncensored-fast.gguf`, the current file): AtomicChat's edit is a rank-1 LoRA
+   on `attn_output`, `ffn_down_exps` and `token_embd`. It is merged into the Q8_K_XL weights at full precision (expert
+   down: NVFP4 scale baked in, padded to 1280 rows), and only those tensors are re-quantized with the 9.3-tuned types;
+   the GPTQ'd and tuned expert gate/up are reused unchanged (`quant/merge_lora.py`). KLD 0.0376 vs the merged Q8 reference (re-tuning the
+   scales on top: 0.0386, not used).
 
 Every engine change was checked against reference logits (KLD, top-1 agreement); none of them changed the output
 beyond float rounding.
@@ -156,27 +162,26 @@ Set `CMAKE_CUDA_ARCHITECTURES` to your GPU (86 = RTX 30xx, 89 = RTX 40xx, 120 = 
 
 ## Run
 
-Place the model GGUFs and the Q8 vision projector next to the scripts, or pass a folder with -ModelDir.
-Standard and Fast use Inkling-2-Mini-fast-9.3-tuned.gguf. Long uses Inkling-2-Mini-fast-long.gguf.
+Place `Inkling-2-Mini-Uncensored-fast.gguf` and the Q8 vision projector next to the scripts, or pass a folder
+with -ModelDir.
 
 ~~~powershell
 .\inkling-fast\run-inkling.ps1
 .\inkling-fast\stop-inkling.ps1
 ~~~
 
-The launcher offers three modes. The image rates include vision encoding and prompt processing.
-Decode rates cover the first reply and a follow-up at about 9k tokens. Top-1 measures agreement with the Q8 reference.
-All three modes use a 512-token microbatch and a 1,024-token image limit by default.
+The launcher starts one configuration: 128k shared context, 8 slots, q4_0 KV, vision, a 512-token microbatch and a
+1,024-token image limit. realtest.py, vision loaded, desktop apps open (image rates include vision encoding and
+prompt processing; decode is the first reply and a follow-up at about 9k tokens):
 
-| Mode | Context | Slots | Global / SWA KV | Photo / screenshot / paste (tok/s) | Decode first / follow-up (tok/s) | Top-1 |
-| --- | ---: | ---: | --- | ---: | ---: | ---: |
-| Standard | 128k | 8 | q4_0 / q4_0 | 953 / 1173 / 1818 | 83.6 / 73.9 | 92.8% |
-| Fast | 64k | 8 | q4_0 / q4_0 | 944 / 1071 / 1789 | 83.7 / 73.9 | 92.8% |
-| Long | 256k | 4 | q3_0 / q4_0 | 917 / 990 / 1603 | 81.6 / 70.2 | 92.0% |
+| Model | Photo / screenshot / paste (tok/s) | Decode first / follow-up (tok/s) |
+| --- | ---: | ---: |
+| Uncensored-fast | 855 / 1001 / 1842 | 82.5 / 73.5 |
+| fast-9.3-tuned (previous, same run) | 843 / 973 / 1805 | 82.1 / 73.4 |
 
-Use `-Mode Standard`, `-Mode Fast`, or `-Mode Long` to skip the menu. The server defaults to vision and the
-`inkling-2-mini` API alias. Long uses four slots to leave VRAM for vision at 256k. `-Parallel` overrides the
-slot count. Other options include `-Ctx`, `-NoVision`, `-Foreground`, `-Port`, `-LocalOnly`, `-CacheRam`, and `-Engine`.
+The Fast (64k) and Long (256k) modes were removed; `-Ctx 65536` still gives a smaller context. The server uses the
+`inkling-2-mini` API alias. Other options include `-Parallel`, `-NoVision`, `-Foreground`, `-Port`, `-LocalOnly`,
+`-CacheRam`, and `-Engine`.
 
 Prefill uses implicit causal bounds for contiguous or position-ordered K/V and dequantizes q3_0/q4_0 tiles in shared memory.
 Set `LLAMA_FA_KV_CHUNK=0` to compare against the dense-mask and staged-conversion paths.
