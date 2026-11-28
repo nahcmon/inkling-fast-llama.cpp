@@ -1,7 +1,7 @@
 > [!NOTE]
 > **This fork: Inkling-2-Mini on a 12 GB GPU.** Branch `inkling-fast2` runs Inkling-2-Mini fully on an RTX 3080 Ti
 > with 128k context, image input and 8 requests at once: ~80 tok/s for one chat, ~196 tok/s total for 8. See [inkling-fast/README.md](inkling-fast/README.md);
-> model files: [nahcmon/Inkling-2-Mini-fast-GGUF](https://huggingface.co/nahcmon/Inkling-2-Mini-fast-GGUF).
+> model files: [nahcmon/Inkling-2-Mini-Uncensored-fast-GGUF](https://huggingface.co/nahcmon/Inkling-2-Mini-Uncensored-fast-GGUF).
 
 # llama.cpp
 

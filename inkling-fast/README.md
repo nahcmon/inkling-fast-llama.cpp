@@ -3,7 +3,7 @@
 Branch `inkling-fast2` of llama.cpp, tuned to run [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 fully on one 12 GB NVIDIA GPU: 128k context, image input, and 8 requests at once (chats or OpenCode subagents)
 from one shared KV cache. The model files are on Hugging Face:
-[nahcmon/Inkling-2-Mini-fast-GGUF](https://huggingface.co/nahcmon/Inkling-2-Mini-fast-GGUF).
+[nahcmon/Inkling-2-Mini-Uncensored-fast-GGUF](https://huggingface.co/nahcmon/Inkling-2-Mini-Uncensored-fast-GGUF).
 
 Current file: `Inkling-2-Mini-Uncensored-fast.gguf` (9.24 GB), a quant of
 [AtomicChat's uncensored fine-tune](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF) with the same
